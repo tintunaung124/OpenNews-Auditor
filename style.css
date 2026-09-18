@@ -1,10 +1,9 @@
 body {
-background-color: #121212;
-color: white;
-font-family: Arial, sans-serif;
-text-align: center;
+    background-color: #121212;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: center;
 }
-
 
 .search-box {
     display: flex;
@@ -12,25 +11,29 @@ text-align: center;
     gap: 10px;
 }
 
-input {
-    width: 400px;
-    padding: 12px;
+.url-label {
+    display: block;
+    font-size: 18px;
+    font-weight: bold;
+    color: white;
+    margin-bottom: 25px;
+}
 
+#article-url {
+    width: 400px;
+    height: 20px;
+    padding: 12px;
     background-color: #202020;
     color: white;
-
     border: 1px solid #333;
     border-radius: 6px;
 }
 
 button {
     padding: 12px 20px;
-
     background-color: white;
     color: black;
-
     border: none;
     border-radius: 6px;
-
     cursor: pointer;
 }
