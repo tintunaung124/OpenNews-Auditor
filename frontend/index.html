@@ -32,22 +32,42 @@
 
 <script>
     document.getElementById("search-button").addEventListener("click", async function() {
+        const urlInput = document.getElementById("article-url").value;
+        const resultDiv = document.getElementById("result");
 
-        const url = document.getElementById("article-url").value;
+        // Safety check if the input is empty
+        if (!urlInput.trim()) {
+            resultDiv.innerText = "Please enter a valid URL first.";
+            return;
+        }
 
-        const response = await fetch("/audit", {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json"
-            },
-            body: JSON.stringify({
-                url: url
-            })
-        });
+        resultDiv.innerText = "Auditing article... Please wait...";
 
-        const data = await response.json();
+        try {
+            const response = await fetch("/audit", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify({
+                    url: urlInput
+                })
+            });
 
-        document.getElementById("result").innerText = data.article;
+            const data = await response.json();
+
+            // Handle backend errors sent from your trafilatura checks
+            if (data.error) {
+                resultDiv.innerText = "Error: " + data.error;
+            } else {
+                resultDiv.innerText = data.article;
+            }
+
+        } catch (error) {
+            // Handle complete server or network dropouts
+            resultDiv.innerText = "Failed to connect to the backend server.";
+            console.error(error);
+        }
     });
 </script>
 
