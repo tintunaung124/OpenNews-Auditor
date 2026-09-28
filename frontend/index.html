@@ -31,44 +31,148 @@
 <div id="result"></div>
 
 <script>
-    document.getElementById("search-button").addEventListener("click", async function() {
-        const urlInput = document.getElementById("article-url").value;
-        const resultDiv = document.getElementById("result");
+    document.getElementById("search-button").addEventListener("click", async () => {
 
-        // Safety check if the input is empty
-        if (!urlInput.trim()) {
-            resultDiv.innerText = "Please enter a valid URL first.";
+    const urlInput = document.getElementById("article-url").value;
+    const resultDiv = document.getElementById("result");
+
+    if (!urlInput) {
+        resultDiv.innerHTML = "<p>Please enter a URL.</p>";
+        return;
+    }
+
+    resultDiv.innerHTML = "<p>Analyzing article...</p>";
+
+    try {
+
+        const response = await fetch("/audit", {
+            method: "POST",
+
+            headers: {
+                "Content-Type": "application/json"
+            },
+
+            body: JSON.stringify({
+                url: urlInput
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.error) {
+            resultDiv.innerHTML = `<p>${data.error}</p>`;
             return;
         }
 
-        resultDiv.innerText = "Auditing article... Please wait...";
+        resultDiv.innerHTML = `
+            <div class="audit-results">
 
-        try {
-            const response = await fetch("/audit", {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify({
-                    url: urlInput
-                })
-            });
+                <h2>Audit Results</h2>
 
-            const data = await response.json();
+                <div class="score-card">
 
-            // Handle backend errors sent from your trafilatura checks
-            if (data.error) {
-                resultDiv.innerText = "Error: " + data.error;
-            } else {
-                resultDiv.innerText = data.article;
-            }
+                    <div class="score-label">
+                        Trust Score
+                    </div>
 
-        } catch (error) {
-            // Handle complete server or network dropouts
-            resultDiv.innerText = "Failed to connect to the backend server.";
-            console.error(error);
-        }
-    });
+                    <div class="score-number">
+                        ${data.llm_score}
+                        <span>/ 100</span>
+                    </div>
+
+                    <div class="score-bar">
+                        <div
+                            class="score-fill fill-good"
+                            style="width: ${data.llm_score}%"
+                        ></div>
+                    </div>
+
+                </div>
+
+
+                <div class="result-card">
+
+                    <h3>Explanation</h3>
+
+                    <p>
+                        ${data.explanation}
+                    </p>
+
+                </div>
+
+
+                <div class="result-card">
+
+                    <h3>Extracted Claims</h3>
+
+                    <div class="claims">
+
+                        ${data.extracted_claims.map((claim, index) => `
+
+                            <div class="claim-card">
+
+                                <div class="claim-number">
+                                    Claim ${index + 1}
+                                </div>
+
+                                <p class="claim-text">
+                                    ${claim.claim}
+                                </p>
+
+                                <div class="claim-details">
+
+                                    <span>
+                                        <strong>Type:</strong>
+                                        ${claim.type}
+                                    </span>
+
+                                    <span>
+                                        <strong>Entities:</strong>
+                                        ${claim.entities.join(", ")}
+                                    </span>
+
+                                    <span>
+                                        <strong>Source:</strong>
+                                        ${claim.source_attribution}
+                                    </span>
+
+                                    <span>
+                                        <strong>Verification:</strong>
+                                        ${claim.verification_required}
+                                    </span>
+
+                                </div>
+
+                            </div>
+
+                        `).join("")}
+
+                    </div>
+
+                </div>
+
+
+                <div class="result-card">
+
+                    <h3>Article</h3>
+
+                    <div class="article-text">
+                        ${data.article}
+                    </div>
+
+                </div>
+
+            </div>
+        `;
+
+    } catch (error) {
+
+        resultDiv.innerHTML = `
+            <p>Error: ${error.message}</p>
+        `;
+    }
+});
+
 </script>
 
 </body>
