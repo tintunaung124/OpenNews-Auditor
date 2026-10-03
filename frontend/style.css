@@ -1,20 +1,20 @@
 :root {
-    --black: #030202;
-    --dark-bg: #080403;
-    --brown-bg: #160805;
-    --brown: #2b1008;
-    --deep-red: #5e1809;
-    --red: #8f260b;
-    --fire-dark: #a93608;
-    --fire: #e94b0b;
-    --fire-bright: #ff7815;
-    --fire-hot: #ffb13b;
-    --text-color: #f1dfcf;
-    --secondary-text: #b99d8b;
-    --muted-text: #71594d;
-    --border-color: #3b180e;
-    --border-glow: #8f2c0d;
-    --card-bg: rgba(10, 5, 3, 0.94);
+    --black: #080400;
+    --dark-bg: #100700;
+    --brown-bg: #1c0d02;
+    --brown: #3a1b05;
+    --deep-red: #7a2600;
+    --red: #ff8c00;
+    --fire-dark: #c45100;
+    --fire: #f06a00;
+    --fire-bright: #ff8500;
+    --fire-hot: #ffb52e;
+    --text-color: #fff1dc;
+    --secondary-text: #d6a66f;
+    --muted-text: #98704a;
+    --border-color: #542605;
+    --border-glow: #ff8c00;
+    --card-bg: rgba(18, 9, 2, 0.94);
     --radius: 10px;
 }
 
@@ -168,29 +168,18 @@ h1::before {
 }
 
 
-/* EYE PUPIL */
-
+/*eye pupil*/
 h1::after {
     content: "";
-
     position: absolute;
-
     top: 50%;
     left: 50%;
-
     width: 1vh;
     height: 4vh;
-
     transform: translate(-50%, -50%);
-
     background-color: #080201;
-
     border-radius: 50%;
-
-    box-shadow:
-        0 0 5px #ff6b12,
-        0 0 12px rgba(255, 70, 5, 0.8);
-
+    box-shadow: 0 0 5px #ff6b12, 0 0 12px rgba(255, 70, 5, 0.8);
     z-index: -1;
 }
 
@@ -934,83 +923,72 @@ button:active {
     }
 }
 
+.headline-analysis {
+    margin-top: 25px;
+}
 
-/* MOBILE */
+.headline-text {
+    margin: 18px 0 24px;
+}
 
-@media (max-width: 600px) {
+.section-label {
+    display: block;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    opacity: 0.5;
+    margin-bottom: 8px;
+}
 
-    body {
-        padding: 4vh 4vw 6vh;
-    }
+.headline-value {
+    margin: 0;
+    font-size: 18px;
+    line-height: 1.5;
+    font-weight: 500;
+}
 
+.headline-checks {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
 
-    /* MOBILE TITLE */
+.headline-check {
+    padding: 16px 18px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.025);
+}
 
-    h1 {
-        font-size: 4vh;
+.check-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 15px;
+    margin-bottom: 8px;
+}
 
-        letter-spacing: 0.2vh;
-    }
+.check-header strong {
+    font-size: 15px;
+}
 
+.headline-status {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    background: rgba(238, 107, 179, 0.12);
+    color: #ee6bb3;
+    white-space: nowrap;
+}
 
-    /* MOBILE LABEL */
-
-    .url-label {
-        font-size: 1.8vh;
-    }
-
-
-    /* MOBILE SEARCH */
-
-    .search-box {
-        flex-direction: column;
-
-        width: 90vw;
-    }
-
-
-    /* MOBILE INPUT */
-
-    #article-url {
-        width: 100%;
-
-        height: 6vh;
-    }
-
-
-    /* MOBILE BUTTON */
-
-    button {
-        width: 100%;
-
-        height: 6vh;
-    }
-
-
-    /* MOBILE RESULTS */
-
-    #result {
-        width: 92vw;
-    }
-
-
-    /* MOBILE SCORE */
-
-    .score-number {
-        font-size: 5vh;
-    }
-
-
-    /* MOBILE CLAIM DETAILS */
-
-    .claim-details {
-        flex-direction: column;
-    }
-
-
-    /* MOBILE CLAIM DETAIL */
-
-    .claim-details span {
-        width: 100%;
-    }
+.headline-check p {
+    margin: 0;
+    font-size: 14px;
+    line-height: 1.6;
+    opacity: 0.72;
 }

@@ -1,25 +1,222 @@
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-
-from trafilatura import fetch_url, extract
-from groq import Groq
-from dotenv import load_dotenv
-
-import os
 import json
+import logging
+import os
+import re
+import time
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+import requests
+import trafilatura
+import uvicorn
+
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from groq import Groq
+from pydantic import BaseModel
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# OPTIONAL AI PROVIDERS
+# ============================================================
+
+try:
+    from google import genai
+except ImportError:
+    genai = None
+
+try:
+    from huggingface_hub import InferenceClient
+except ImportError:
+    InferenceClient = None
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s: %(message)s"
+)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+# ============================================================
+# ENVIRONMENT
 # ============================================================
 
 load_dotenv()
 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+HF_TOKEN = os.getenv("HF_TOKEN")
+
 
 # ============================================================
-# ARTICLE REQUEST
+# AI MODEL SETTINGS
+# ============================================================
+
+GROQ_MODEL = "openai/gpt-oss-120b"
+
+# Current Gemini API model.
+GEMINI_MODEL = "gemini-3.8-flash"
+
+# Hugging Face model.
+# Hugging Face automatically selects an available inference
+# provider when provider="auto" is used.
+HF_MODEL = "openai/gpt-oss-120b"
+
+
+# ============================================================
+# HTTP SETTINGS
+# ============================================================
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 "
+        "(Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/142.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+DEFAULT_TIMEOUT = 15
+GOOGLE_NEWS_TIMEOUT = 15
+
+MAX_NEWS_RESULTS = 8
+MAX_EVIDENCE_SOURCES = 5
+
+# Do not score an article unless at least this percentage
+# of claims received usable external evidence.
+MINIMUM_EVIDENCE_COVERAGE = 0.50
+
+
+# ============================================================
+# VERIFICATION STATUS
+# ============================================================
+
+ALLOWED_STATUSES = {
+    "SUPPORTED",
+    "PARTIALLY_SUPPORTED",
+    "UNSUPPORTED",
+    "CONTRADICTED",
+    "UNVERIFIED",
+}
+
+STATUS_SCORES = {
+    "SUPPORTED": 100,
+    "PARTIALLY_SUPPORTED": 65,
+    "UNSUPPORTED": 25,
+    "CONTRADICTED": 0,
+}
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
+
+app = FastAPI(
+    title="OpenNews Auditor"
+)
+
+
+# ============================================================
+# FRONTEND
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+FRONTEND_DIR = BASE_DIR.parent / "frontend"
+
+app.mount(
+    "/static",
+    StaticFiles(directory=str(FRONTEND_DIR)),
+    name="static"
+)
+
+
+@app.get("/")
+def home():
+    return FileResponse(
+        str(FRONTEND_DIR / "index.html")
+    )
+
+
+# ============================================================
+# AI CLIENTS
+# ============================================================
+
+groq_client = None
+gemini_client = None
+hf_client = None
+
+
+if GROQ_API_KEY:
+    groq_client = Groq(
+        api_key=GROQ_API_KEY
+    )
+    logging.info("Groq API enabled.")
+else:
+    logging.warning(
+        "GROQ_API_KEY not found. Groq disabled."
+    )
+
+
+if GEMINI_API_KEY and genai:
+    try:
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+        logging.info("Gemini API enabled.")
+    except Exception as e:
+        logging.warning(
+            f"Gemini initialization failed: {e}"
+        )
+
+
+if HF_TOKEN and InferenceClient:
+    try:
+        hf_client = InferenceClient(
+            api_key=HF_TOKEN,
+            provider="auto"
+        )
+        logging.info(
+            "Hugging Face API enabled."
+        )
+    except Exception as e:
+        logging.warning(
+            f"Hugging Face initialization failed: {e}"
+        )
+
+
+if not any(
+    [
+        groq_client,
+        gemini_client,
+        hf_client
+    ]
+):
+    raise ValueError(
+        "No AI provider is configured. "
+        "Add GROQ_API_KEY, GEMINI_API_KEY, "
+        "or HF_TOKEN to the .env file."
+    )
+
+
+# ============================================================
+# REQUEST MODEL
 # ============================================================
 
 class ArticleRequest(BaseModel):
@@ -27,739 +224,1847 @@ class ArticleRequest(BaseModel):
 
 
 # ============================================================
-# OPENNEWS AUDITOR
+# GENERAL HELPERS
 # ============================================================
 
-class OpenNewsAuditor:
+def _clean_json_markdown(text: str) -> str:
+    """
+    Remove Markdown code fences if an AI model returns JSON
+    inside ```json ... ```.
+    """
 
-    def __init__(self):
+    if not text:
+        return ""
 
-        self.client = Groq(
-            api_key=os.getenv("GROQ_API_KEY")
+    text = text.strip()
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
+
+    return text.strip()
+
+
+def _extract_json(text: str) -> Any:
+    """
+    Safely extract JSON from an AI response.
+    """
+
+    cleaned = _clean_json_markdown(text)
+
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Try to find an object.
+    object_match = re.search(
+        r"\{.*\}",
+        cleaned,
+        flags=re.DOTALL
+    )
+
+    if object_match:
+        try:
+            return json.loads(
+                object_match.group(0)
+            )
+        except json.JSONDecodeError:
+            pass
+
+    # Try to find an array.
+    array_match = re.search(
+        r"\[.*\]",
+        cleaned,
+        flags=re.DOTALL
+    )
+
+    if array_match:
+        try:
+            return json.loads(
+                array_match.group(0)
+            )
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(
+        "The AI response did not contain valid JSON."
+    )
+
+
+# ============================================================
+# GROQ
+# ============================================================
+
+def ask_groq(prompt: str) -> str:
+
+    if not groq_client:
+        raise RuntimeError(
+            "Groq is not configured."
         )
 
+    response = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.1
+    )
+
+    result = response.choices[0].message.content
+
+    if not result:
+        raise ValueError(
+            "Groq returned an empty response."
+        )
+
+    return _clean_json_markdown(result)
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+def ask_gemini(prompt: str) -> str:
+
+    if not gemini_client:
+        raise RuntimeError(
+            "Gemini is not configured."
+        )
+
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
+    )
+
+    result = response.text
+
+    if not result:
+        raise ValueError(
+            "Gemini returned an empty response."
+        )
+
+    return _clean_json_markdown(result)
+
+
+# ============================================================
+# HUGGING FACE
+# ============================================================
 
-    # ========================================================
-    # FETCH ARTICLE
-    # ========================================================
+def ask_huggingface(prompt: str) -> str:
 
-    def fetch_article(self, url):
+    if not hf_client:
+        raise RuntimeError(
+            "Hugging Face is not configured."
+        )
 
-        downloaded = fetch_url(url)
+    response = hf_client.chat.completions.create(
+        model=HF_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        temperature=0.1,
+        max_tokens=4096
+    )
+
+    result = response.choices[0].message.content
 
-        if downloaded is None:
-            return None
+    if not result:
+        raise ValueError(
+            "Hugging Face returned an empty response."
+        )
 
-        return downloaded
+    return _clean_json_markdown(result)
 
 
-    # ========================================================
-    # EXTRACT ARTICLE TEXT
-    # ========================================================
+# ============================================================
+# UNIVERSAL AI FALLBACK
+# ============================================================
 
-    def extract_article(self, downloaded):
+def ask_ai(
+    prompt: str,
+    purpose: str = "AI analysis"
+) -> str:
+    """
+    Try AI providers in this order:
 
-        article = extract(downloaded)
+        1. Groq
+        2. Gemini
+        3. Hugging Face
 
-        if article is None:
-            return None
+    If one provider fails, automatically try the next one.
+    """
 
-        return article
+    providers = [
+        (
+            "Groq",
+            ask_groq,
+            groq_client
+        ),
+        (
+            "Gemini",
+            ask_gemini,
+            gemini_client
+        ),
+        (
+            "Hugging Face",
+            ask_huggingface,
+            hf_client
+        ),
+    ]
 
+    errors = []
 
-    # ========================================================
-    # ANALYZE ARTICLE
-    # ========================================================
+    for provider_name, provider_function, client in providers:
 
-    def analyze_article(self, article):
+        if not client:
+            continue
 
-        prompt = f"""
+        try:
 
-PART 1: Main Claim Extraction
+            logging.info(
+                f"AI provider: {provider_name} "
+                f"for {purpose}"
+            )
+
+            result = provider_function(
+                prompt
+            )
+
+            logging.info(
+                f"{provider_name} succeeded."
+            )
+
+            return result
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            errors.append(
+                f"{provider_name}: {error_text}"
+            )
+
+            if "429" in error_text:
+
+                logging.warning(
+                    f"{provider_name} rate limit reached."
+                )
+
+            else:
 
-Extract ONLY the main factual claims from the article.
+                logging.warning(
+                    f"{provider_name} failed: "
+                    f"{error_text}"
+                )
+
+            logging.info(
+                f"Trying next AI provider..."
+            )
+
+    raise RuntimeError(
+        f"All AI providers failed for "
+        f"{purpose}. "
+        f"Errors: {' | '.join(errors)}"
+    )
+
+
+# ============================================================
+# ARTICLE EXTRACTION
+# ============================================================
+
+def fetch_article(
+    url: str
+) -> dict[str, str]:
+
+    logging.info(
+        f"Fetching article: {url}"
+    )
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=DEFAULT_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as e:
+
+        raise RuntimeError(
+            f"Could not access article URL: {e}"
+        )
+
+    html = response.text
+
+    article_text = trafilatura.extract(
+        html,
+        include_comments=False,
+        include_tables=False,
+        include_links=False,
+        favor_precision=True
+    )
+
+    # Fallback if Trafilatura does not extract enough text.
+    if not article_text or len(article_text) < 200:
 
-Follow these rules strictly:
+        logging.warning(
+            "Trafilatura extracted little text. "
+            "Trying fallback extraction."
+        )
 
-1. Extract individual factual claims, NOT the article itself.
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
 
-2. Each claim must be ONE concise sentence.
+        for tag in soup(
+            [
+                "script",
+                "style",
+                "noscript",
+                "nav",
+                "footer",
+                "header"
+            ]
+        ):
+            tag.decompose()
 
-3. Extract only claims that can be independently verified using external evidence.
+        article_text = soup.get_text(
+            " ",
+            strip=True
+        )
 
-4. Do NOT copy paragraphs, sections, introductions, background information, or the full article.
+    if not article_text:
+        raise RuntimeError(
+            "Could not extract article text."
+        )
 
-5. Do NOT summarize the article.
+    headline = ""
 
-6. Do NOT include personal stories unless they contain a specific independently verifiable factual claim.
+    try:
 
-7. Do NOT include opinions, emotions, predictions, rhetorical statements, or general descriptions.
+        metadata = trafilatura.extract_metadata(
+            html
+        )
 
-8. Do NOT include the same claim more than once.
+        if metadata:
 
-9. Focus on important claims involving:
+            headline = (
+                getattr(
+                    metadata,
+                    "title",
+                    None
+                )
+                or ""
+            )
 
-   - specific people
-   - organizations
-   - laws or policies
-   - events
-   - dates
-   - numbers/statistics
-   - government actions
-   - diplomatic actions
-   - deportations or other documented actions
+    except Exception:
+        pass
 
-10. Prefer specific claims over vague statements.
+    if not headline:
 
-11. Extract approximately 5-10 of the most important factual claims.
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
 
-12. Never return the full article text as a claim.
+        title_tag = soup.find(
+            "title"
+        )
 
-13. The "claim" field must contain ONLY one individual factual claim, not multiple claims or paragraphs.
+        if title_tag:
+            headline = title_tag.get_text(
+                " ",
+                strip=True
+            )
 
-14. Keep each claim short and close to the meaning of the original article.
+    return {
+        "text": article_text,
+        "headline": headline,
+        "url": url
+    }
 
-15. If the article contains fewer than 5 meaningful factual claims, extract only the claims that actually exist. Do not invent claims.
 
-16. Do NOT assume that a claim is true simply because the article states it.
+# ============================================================
+# CLAIM EXTRACTION
+# ============================================================
 
-17. Preserve the meaning of the original claim without adding information that is not present in the article.
+def extract_claims(
+    article_text: str
+) -> list[dict[str, Any]]:
 
-18. Separate different factual claims into separate entries whenever they can be independently verified.
+    # Limit enormous articles.
+    article_for_ai = article_text[:30000]
 
-For every extracted claim, return:
+    prompt = f"""
+You are the claim extraction component of a news auditing system.
 
-- Type
-- Entities involved
-- Evidence provided in the article
-- Source Attribution type
-- Whether Verification is Required
+Read the article below and identify the main factual claims that
+can be independently checked using external evidence.
 
-The purpose of this section is to identify the specific factual claims that will later be assessed for truthfulness and evidentiary support.
+Extract between 5 and 10 important claims.
 
+Only extract claims that are factual and potentially verifiable.
 
-PART 2: Trust Assessment
+Do NOT decide whether a claim is true or false.
 
-Assess the overall factual reliability of the article based primarily on how TRUE and WELL-SUPPORTED its factual claims are.
+Do NOT add facts that are not present in the article.
 
-The trust score MUST represent the degree to which the article's important factual claims are supported by reliable evidence.
+Ignore opinions, predictions, rhetorical questions, and purely
+subjective statements unless they contain a specific factual claim.
 
-When assessing the article:
+Return ONLY valid JSON.
 
-1. Consider whether the factual claims are supported by evidence provided in the article.
-
-2. Consider whether the article attributes claims to specific and identifiable sources.
-
-3. Consider whether the claims are consistent with reliable, established facts and known information.
-
-4. Identify claims that appear unsupported, misleading, exaggerated, internally inconsistent, or contradicted by reliable evidence.
-
-5. Distinguish between:
-
-   - Supported claims
-   - Unsupported claims
-   - Contradicted claims
-   - Claims that cannot currently be verified
-
-6. Do NOT assume that a claim is true merely because it is presented confidently or written in a professional style.
-
-7. Do NOT assume that a claim is false merely because the article does not provide enough evidence.
-
-8. If a claim cannot be verified with the available information, treat it as UNVERIFIED rather than automatically TRUE or FALSE.
-
-9. Give greater importance to major factual claims than minor details.
-
-10. Do not allow opinions, emotional language, writing quality, or political agreement/disagreement to determine the trust score unless they directly affect the factual reliability of the claims.
-
-11. Do not reward an article simply for having many citations. Consider the quality and relevance of the evidence.
-
-12. Do not penalize an article simply because it contains opinions, as long as those opinions are clearly presented as opinions and are not presented as factual claims.
-
-13. The trust score should decrease when important claims are unsupported or contradicted by reliable evidence.
-
-14. The trust score should increase when important claims are supported by specific, relevant, and reliable evidence.
-
-15. The score should reflect the article as a whole, not just one individual claim.
-
-
-TRUST SCORE:
-
-Provide a numeric trust score from 0 to 100.
-
-The score represents the overall factual reliability of the article's claims:
-
-- 90-100: The important factual claims are strongly supported by reliable evidence, with little meaningful uncertainty.
-
-- 70-89: Most important factual claims are supported, but there may be some minor unsupported, uncertain, or questionable claims.
-
-- 50-69: The article contains a mixture of supported, unsupported, and/or unverified claims, creating significant uncertainty about its overall factual reliability.
-
-- 30-49: Multiple important claims are poorly supported, misleading, or contradicted by reliable evidence.
-
-- 0-29: Most important claims lack reliable support or are substantially contradicted by reliable evidence.
-
-
-IMPORTANT:
-
-The trust score is NOT a measure of:
-
-- how persuasive the article is
-- how professional the writing looks
-- whether the article agrees with a particular political position
-- whether the article contains emotional language
-- whether the article is popular
-- whether the article comes from a familiar publication
-
-The trust score IS primarily a measure of:
-
-- how true the factual claims appear to be
-- how well those claims are supported by evidence
-- how reliable the article's sources are
-- whether important claims are contradicted by reliable evidence
-- how much uncertainty remains around the article's factual claims
-
-Provide a 2-3 sentence explanation of the overall trust score. The explanation must specifically mention the main reasons for the score, such as supported claims, unsupported claims, contradictions, or significant uncertainty.
-
-
-OUTPUT FORMAT:
-
-Your output MUST be a valid JSON object. Do not include markdown formatting, backticks, or extra text.
-
-Use this exact JSON structure:
+Use this exact format:
 
 {{
-    "llm_score": 85,
-
-    "explanation": "The article's main factual claims are generally well-supported by identifiable evidence, although some claims remain insufficiently supported or unverified. The overall score reflects the balance between supported claims and the level of uncertainty surrounding the remaining claims.",
-
-    "extracted_claims": [
-
-        {{
-            "claim": "The exact individual factual statement.",
-
-            "type": "Fact",
-
-            "entities": [
-                "Entity 1",
-                "Entity 2"
-            ],
-
-            "evidence_in_article": "Specific quote or attribution, or 'No evidence provided.'",
-
-            "source_attribution": "Named source, organization, or 'No source attribution.'",
-
-            "verification_required": "Yes"
-        }}
-
-    ]
+  "claims": [
+    {{
+      "claim": "A specific factual statement",
+      "type": "event|location|number|person|organization|policy|historical|other",
+      "entities": ["important entity"],
+      "evidence_in_article": "Short description of where the article supports the claim",
+      "source_attribution": "Named source if the article attributes the claim, otherwise empty string",
+      "verification_required": true
+    }}
+  ]
 }}
-
 
 ARTICLE:
 
-{article}
-
+{article_for_ai}
 """
 
-        # ====================================================
-        # SEND ARTICLE TO GROQ
-        # ====================================================
+    try:
 
-        response = self.client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ]
+        raw = ask_ai(
+            prompt,
+            purpose="claim extraction"
+        )
+
+        data = _extract_json(raw)
+
+        if isinstance(data, dict):
+
+            claims = data.get(
+                "claims",
+                []
+            )
+
+        elif isinstance(data, list):
+
+            claims = data
+
+        else:
+
+            claims = []
+
+        if not isinstance(
+            claims,
+            list
+        ):
+            claims = []
+
+        return claims[:10]
+
+    except Exception as e:
+
+        logging.error(
+            f"Claim extraction error: {e}"
+        )
+
+        raise RuntimeError(
+            "Could not extract factual claims "
+            "from the article."
         )
 
 
-        # ====================================================
-        # GET GROQ RESPONSE
-        # ====================================================
+# ============================================================
+# LOCAL SEARCH QUERY GENERATOR
+# ============================================================
 
-        clean_text = response.choices[0].message.content.strip()
+def generate_search_query(
+    claim: dict[str, Any]
+) -> str:
+    """
+    Generate a simple search query locally.
+
+    IMPORTANT:
+    This no longer uses an AI call.
+
+    This reduces API usage significantly.
+    """
+
+    claim_text = claim.get(
+        "claim",
+        ""
+    )
+
+    if not claim_text:
+        return ""
+
+    # Important named entities first.
+    entities = claim.get(
+        "entities",
+        []
+    )
+
+    query_parts = []
+
+    if isinstance(
+        entities,
+        list
+    ):
+
+        for entity in entities:
+
+            if not isinstance(
+                entity,
+                str
+            ):
+                continue
+
+            entity = entity.strip()
+
+            if entity and entity not in query_parts:
+
+                query_parts.append(
+                    entity
+                )
+
+    stop_words = {
+        "the",
+        "a",
+        "an",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "that",
+        "this",
+        "these",
+        "those",
+        "and",
+        "or",
+        "but",
+        "of",
+        "to",
+        "in",
+        "on",
+        "for",
+        "with",
+        "from",
+        "by",
+        "as",
+        "after",
+        "before",
+        "during",
+        "into",
+        "its",
+        "their",
+        "it",
+        "they",
+        "he",
+        "she",
+        "who",
+        "which",
+        "that",
+        "according",
+        "said"
+    }
+
+    words = claim_text.split()
+
+    for word in words:
+
+        cleaned = word.strip(
+            ".,!?;:()[]{}\"'“”‘’"
+        )
+
+        if not cleaned:
+            continue
+
+        if cleaned.lower() in stop_words:
+            continue
+
+        if len(cleaned) <= 2:
+            continue
+
+        if cleaned not in query_parts:
+
+            query_parts.append(
+                cleaned
+            )
+
+        if len(query_parts) >= 10:
+            break
+
+    return " ".join(
+        query_parts[:10]
+    )
 
 
-        # ====================================================
-        # CLEAN LLM RESPONSE
-        # ====================================================
+# ============================================================
+# GOOGLE NEWS RSS
+# ============================================================
 
-        clean_text = clean_text.replace(
-            "```json",
+def _fetch_google_news_articles(
+    query: str
+) -> list[dict[str, Any]]:
+
+    print(
+        "\nSearching Google News RSS..."
+    )
+
+    google_news_url = (
+        "https://news.google.com/rss/search"
+    )
+
+    params = {
+        "q": query,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en"
+    }
+
+    try:
+
+        response = requests.get(
+            google_news_url,
+            params=params,
+            headers=DEFAULT_HEADERS,
+            timeout=GOOGLE_NEWS_TIMEOUT
+        )
+
+        print(
+            "Google News RSS HTTP status: "
+            f"{response.status_code}"
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as e:
+
+        logging.error(
+            f"Google News RSS request error: {e}"
+        )
+
+        return []
+
+    soup = BeautifulSoup(
+        response.content,
+        "xml"
+    )
+
+    results = []
+    seen_urls = set()
+
+    items = soup.find_all(
+        "item"
+    )
+
+    print(
+        "Google News articles found: "
+        f"{len(items)}"
+    )
+
+    for item in items:
+
+        title_tag = item.find(
+            "title"
+        )
+
+        link_tag = item.find(
+            "link"
+        )
+
+        description_tag = item.find(
+            "description"
+        )
+
+        source_tag = item.find(
+            "source"
+        )
+
+        pub_date_tag = item.find(
+            "pubDate"
+        )
+
+        if not title_tag or not link_tag:
+            continue
+
+        title = title_tag.get_text(
+            strip=True
+        )
+
+        google_url = link_tag.get_text(
+            strip=True
+        )
+
+        description = ""
+
+        if description_tag:
+
+            description = BeautifulSoup(
+                description_tag.get_text(),
+                "html.parser"
+            ).get_text(
+                " ",
+                strip=True
+            )
+
+        source_name = ""
+
+        if source_tag:
+
+            source_name = source_tag.get_text(
+                strip=True
+            )
+
+        published = ""
+
+        if pub_date_tag:
+
+            published = pub_date_tag.get_text(
+                strip=True
+            )
+
+        if not google_url:
+            continue
+
+        if google_url in seen_urls:
+            continue
+
+        seen_urls.add(
+            google_url
+        )
+
+        results.append(
+            {
+                "title": title,
+                "description": description,
+                "url": google_url,
+                "google_url": google_url,
+                "source": source_name,
+                "published": published,
+                "is_google_news_link": True
+            }
+        )
+
+        if len(results) >= MAX_NEWS_RESULTS:
+            break
+
+    return results
+
+
+# ============================================================
+# NEWS SEARCH
+# ============================================================
+
+def search_news(
+    claim: dict[str, Any]
+) -> list[dict[str, Any]]:
+
+    claim_text = claim.get(
+        "claim",
+        ""
+    )
+
+    print(
+        "\nChecking claim: "
+        f"{claim_text}"
+    )
+
+    search_query = generate_search_query(
+        claim
+    )
+
+    print(
+        "Generated search query: "
+        f"{search_query}"
+    )
+
+    if not search_query:
+
+        logging.warning(
+            "Empty search query."
+        )
+
+        return []
+
+    articles = _fetch_google_news_articles(
+        search_query
+    )
+
+    print(
+        "Total unique articles collected: "
+        f"{len(articles)}"
+    )
+
+    return articles
+
+
+# ============================================================
+# COLLECT EVIDENCE
+# ============================================================
+
+def collect_evidence(
+    articles: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+
+    evidence = []
+
+    for article in articles:
+
+        if len(evidence) >= MAX_EVIDENCE_SOURCES:
+            break
+
+        title = article.get(
+            "title",
             ""
-        ).replace(
-            "```",
+        )
+
+        description = article.get(
+            "description",
             ""
-        ).strip()
+        )
+
+        url = article.get(
+            "url",
+            ""
+        )
+
+        source_name = article.get(
+            "source",
+            ""
+        )
+
+        # ----------------------------------------------------
+        # GOOGLE NEWS RSS RESULT
+        # ----------------------------------------------------
+
+        if article.get(
+            "is_google_news_link"
+        ):
+
+            evidence.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "url": url,
+                    "source": source_name,
+                    "published": article.get(
+                        "published",
+                        ""
+                    ),
+                    "text": (
+                        f"Headline: {title}\n"
+                        f"Publisher: {source_name}\n"
+                        f"Published: "
+                        f"{article.get('published', '')}\n"
+                        f"Description: {description}"
+                    ),
+                    "evidence_type": (
+                        "Google News RSS metadata"
+                    )
+                }
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # NORMAL ARTICLE URL
+        # ----------------------------------------------------
+
+        try:
+
+            response = requests.get(
+                url,
+                headers=DEFAULT_HEADERS,
+                timeout=DEFAULT_TIMEOUT
+            )
+
+            response.raise_for_status()
+
+            text = trafilatura.extract(
+                response.text,
+                include_comments=False,
+                include_tables=False,
+                include_links=False,
+                favor_precision=True
+            )
+
+            if not text:
+                continue
+
+            evidence.append(
+                {
+                    "title": title,
+                    "description": description,
+                    "url": url,
+                    "source": source_name,
+                    "published": article.get(
+                        "published",
+                        ""
+                    ),
+                    "text": text[:12000],
+                    "evidence_type": "External article"
+                }
+            )
+
+        except Exception as e:
+
+            logging.warning(
+                f"Could not extract evidence "
+                f"from {url}: {e}"
+            )
+
+    return evidence
 
 
-        # ====================================================
-        # CONVERT JSON TEXT TO PYTHON DATA
-        # ====================================================
+# ============================================================
+# BATCH CLAIM VERIFICATION
+# ============================================================
 
-        analysis = json.loads(clean_text)
+def verify_claims(
+    claims: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
 
-        return analysis
+    if not claims:
+        return []
 
+    prepared_claims = []
 
-    # ========================================================
-    # AUDIT ARTICLE
-    # ========================================================
+    # --------------------------------------------------------
+    # SEARCH FOR EVIDENCE
+    # --------------------------------------------------------
 
-    def audit(self, url):
+    for index, claim in enumerate(
+        claims,
+        start=1
+    ):
 
-        # ====================================================
-        # FETCH ARTICLE
-        # ====================================================
+        print(
+            f"\n========== CLAIM {index} =========="
+        )
 
-        downloaded = self.fetch_article(url)
+        articles = search_news(
+            claim
+        )
 
-        if downloaded is None:
+        evidence = collect_evidence(
+            articles
+        )
 
-            return {
-                "error": "Could not fetch article"
+        claim_copy = dict(
+            claim
+        )
+
+        claim_copy["_evidence"] = evidence
+
+        prepared_claims.append(
+            claim_copy
+        )
+
+    # --------------------------------------------------------
+    # CREATE ONE BATCH PROMPT
+    # --------------------------------------------------------
+
+    claim_sections = []
+
+    for index, claim in enumerate(
+        prepared_claims,
+        start=1
+    ):
+
+        evidence = claim.get(
+            "_evidence",
+            []
+        )
+
+        evidence_sections = []
+
+        for evidence_index, item in enumerate(
+            evidence,
+            start=1
+        ):
+
+            evidence_sections.append(
+                f"""
+Evidence {evidence_index}
+
+Evidence type:
+{item.get('evidence_type', '')}
+
+Publisher:
+{item.get('source', '')}
+
+Title:
+{item.get('title', '')}
+
+Published:
+{item.get('published', '')}
+
+URL:
+{item.get('url', '')}
+
+Content:
+{item.get('text', '')[:7000]}
+"""
+            )
+
+        if not evidence_sections:
+
+            evidence_text = (
+                "No usable external evidence "
+                "was found."
+            )
+
+        else:
+
+            evidence_text = "\n".join(
+                evidence_sections
+            )
+
+        claim_sections.append(
+            f"""
+==================================================
+CLAIM {index}
+==================================================
+
+Claim:
+{claim.get('claim', '')}
+
+Type:
+{claim.get('type', '')}
+
+Entities:
+{json.dumps(claim.get('entities', []))}
+
+Evidence from original article:
+{claim.get('evidence_in_article', '')}
+
+Source attribution:
+{claim.get('source_attribution', '')}
+
+External evidence:
+{evidence_text}
+"""
+        )
+
+    all_claims_text = "\n".join(
+        claim_sections
+    )
+
+    prompt = f"""
+You are the factual claim verification component of
+a news auditing system.
+
+Verify each claim using ONLY the external evidence
+provided below.
+
+Do not use your general world knowledge as evidence.
+
+IMPORTANT RULES:
+
+1. SUPPORTED means the evidence directly supports the
+   specific claim.
+
+2. PARTIALLY_SUPPORTED means only part of the claim
+   is supported or important details are missing.
+
+3. UNSUPPORTED means evidence was available but does
+   not support the claim.
+
+4. CONTRADICTED means reliable evidence directly
+   conflicts with the claim.
+
+5. UNVERIFIED means there is not enough usable evidence
+   to determine whether the claim is supported.
+
+6. Lack of evidence does NOT automatically mean false.
+
+7. A Google News RSS headline alone is weak evidence.
+   Do not treat a headline as complete proof of a claim.
+
+8. Do not invent facts.
+
+9. Do not assume multiple articles repeating the same
+   statement independently verify it.
+
+10. Compare exact details such as:
+    - people
+    - places
+    - dates
+    - numbers
+    - organizations
+    - events
+    - relationships
+    - actions
+
+Return ONLY valid JSON.
+
+Use exactly this structure:
+
+{{
+  "verifications": [
+    {{
+      "claim_index": 1,
+      "status": "SUPPORTED",
+      "reason": "Short factual explanation.",
+      "supporting_sources": [
+        "Publisher name"
+      ]
+    }}
+  ]
+}}
+
+Allowed status values:
+
+SUPPORTED
+PARTIALLY_SUPPORTED
+UNSUPPORTED
+CONTRADICTED
+UNVERIFIED
+
+CLAIMS AND EVIDENCE:
+
+{all_claims_text}
+"""
+
+    # --------------------------------------------------------
+    # ASK AI
+    # --------------------------------------------------------
+
+    try:
+
+        raw = ask_ai(
+            prompt,
+            purpose="batch claim verification"
+        )
+
+        data = _extract_json(
+            raw
+        )
+
+        if isinstance(
+            data,
+            dict
+        ):
+
+            verifications = data.get(
+                "verifications",
+                []
+            )
+
+        elif isinstance(
+            data,
+            list
+        ):
+
+            verifications = data
+
+        else:
+
+            verifications = []
+
+    except Exception as e:
+
+        logging.error(
+            f"Batch verification error: {e}"
+        )
+
+        verifications = []
+
+    # --------------------------------------------------------
+    # INDEX AI RESULTS
+    # --------------------------------------------------------
+
+    verification_map = {}
+
+    for item in verifications:
+
+        try:
+
+            claim_index = int(
+                item.get(
+                    "claim_index"
+                )
+            )
+
+            verification_map[
+                claim_index
+            ] = item
+
+        except Exception:
+            continue
+
+    # --------------------------------------------------------
+    # BUILD FINAL CLAIM RESULTS
+    # --------------------------------------------------------
+
+    verified_claims = []
+
+    for index, claim in enumerate(
+        prepared_claims,
+        start=1
+    ):
+
+        evidence = claim.pop(
+            "_evidence",
+            []
+        )
+
+        verification = (
+            verification_map.get(
+                index
+            )
+        )
+
+        if not verification:
+
+            verification = {
+                "claim_index": index,
+                "status": (
+                    "UNVERIFIED"
+                ),
+                "reason": (
+                    "The AI verification "
+                    "service could not "
+                    "evaluate this claim."
+                ),
+                "supporting_sources": []
             }
 
+        status = str(
+            verification.get(
+                "status",
+                "UNVERIFIED"
+            )
+        ).upper().strip()
 
-        # ====================================================
-        # EXTRACT ARTICLE
-        # ====================================================
+        if status not in ALLOWED_STATUSES:
 
-        article = self.extract_article(downloaded)
+            status = "UNVERIFIED"
 
-        if article is None:
+        verification["status"] = status
 
-            return {
-                "error": "Could not extract article text"
+        claim["verification"] = (
+            verification
+        )
+
+        claim["verification_result"] = (
+            status
+        )
+
+        claim["evidence_count"] = (
+            len(evidence)
+        )
+
+        claim["evidence_sources"] = [
+            {
+                "title": item.get(
+                    "title",
+                    ""
+                ),
+                "source": item.get(
+                    "source",
+                    ""
+                ),
+                "published": item.get(
+                    "published",
+                    ""
+                ),
+                "url": item.get(
+                    "url",
+                    ""
+                ),
+                "evidence_type": item.get(
+                    "evidence_type",
+                    ""
+                )
             }
+            for item in evidence
+        ]
+
+        verified_claims.append(
+            claim
+        )
+
+    return verified_claims
 
 
-        # ====================================================
-        # ANALYZE ARTICLE
-        # ====================================================
+# ============================================================
+# TRUST SCORE
+# ============================================================
 
-        analysis = self.analyze_article(article)
+def calculate_score(
+    claims: list[dict[str, Any]]
+) -> float | None:
+
+    if not claims:
+        return None
+
+    scored_claims = []
+
+    for claim in claims:
+
+        status = claim.get(
+            "verification_result",
+            "UNVERIFIED"
+        )
+
+        if status not in STATUS_SCORES:
+            continue
+
+        claim_text = claim.get(
+            "claim",
+            ""
+        )
+
+        # Longer factual claims often contain more
+        # independently checkable information.
+        weight = (
+            1.25
+            if len(claim_text) > 150
+            else 1.0
+        )
+
+        scored_claims.append(
+            (
+                status,
+                weight
+            )
+        )
+
+    total_claims = len(
+        claims
+    )
+
+    verified_claim_count = len(
+        scored_claims
+    )
+
+    evidence_coverage = (
+        verified_claim_count
+        / total_claims
+    )
+
+    logging.info(
+        f"Evidence coverage: "
+        f"{verified_claim_count}/"
+        f"{total_claims} "
+        f"({evidence_coverage:.0%})"
+    )
+
+    # Not enough external evidence to responsibly
+    # calculate a trust score.
+    if evidence_coverage < MINIMUM_EVIDENCE_COVERAGE:
+
+        logging.warning(
+            "Insufficient evidence for "
+            "trust score."
+        )
+
+        return None
+
+    weighted_total = 0.0
+    total_weight = 0.0
+
+    for status, weight in scored_claims:
+
+        weighted_total += (
+            STATUS_SCORES[status]
+            * weight
+        )
+
+        total_weight += weight
+
+    if total_weight == 0:
+        return None
+
+    score = (
+        weighted_total
+        / total_weight
+    )
+
+    return round(
+        score,
+        1
+    )
 
 
-        # ====================================================
-        # RETURN RESULTS
-        # ====================================================
+# ============================================================
+# HEADLINE ANALYSIS
+# ============================================================
+
+def analyze_headline(
+    headline: str,
+    article_text: str
+) -> dict[str, Any]:
+
+    if not headline:
 
         return {
+            "headline": "",
+            "bias": {
+                "status": "NO_CLEAR_INDICATORS",
+                "reason": ""
+            },
+            "misleading": {
+                "status": "NO_CLEAR_INDICATORS",
+                "reason": ""
+            },
+            "sensationalism": {
+                "status": "LOW",
+                "reason": ""
+            }
+        }
 
-            "url": url,
+    article_excerpt = article_text[:12000]
 
-            "article": article,
+    prompt = f"""
+You are analyzing a news headline for an auditing system.
 
-            "llm_score": analysis.get(
-                "llm_score",
-                50
-            ),
+Analyze the headline only in relation to the article content
+provided below.
 
-            "explanation": analysis.get(
-                "explanation",
-                "Analysis complete."
-            ),
+Do NOT determine whether the article is true or false.
 
-            "extracted_claims": analysis.get(
-                "extracted_claims",
-                []
+Do NOT accuse the publisher of intentional deception.
+
+Do NOT infer political affiliation.
+
+Look for:
+
+1. Potential bias
+   Does the wording frame a person, organization, event,
+   or issue in a noticeably positive or negative way?
+
+2. Potentially misleading presentation
+   Does the headline omit or distort important context
+   compared with the article?
+
+3. Sensationalism
+   Does the wording use dramatic, exaggerated, emotional,
+   or attention-seeking language?
+
+Important:
+A single negative or positive word does not automatically
+mean the headline is biased.
+
+Return ONLY valid JSON.
+
+Use this exact structure:
+
+{{
+  "headline": "{headline}",
+  "bias": {{
+    "status": "NO_CLEAR_INDICATORS",
+    "reason": "Short explanation."
+  }},
+  "misleading": {{
+    "status": "NO_CLEAR_INDICATORS",
+    "reason": "Short explanation."
+  }},
+  "sensationalism": {{
+    "status": "LOW",
+    "reason": "Short explanation."
+  }}
+}}
+
+Allowed bias statuses:
+
+NO_CLEAR_INDICATORS
+POTENTIAL_BIAS
+
+Allowed misleading statuses:
+
+NO_CLEAR_INDICATORS
+POTENTIALLY_MISLEADING
+
+Allowed sensationalism:
+
+LOW
+MODERATE
+HIGH
+
+HEADLINE:
+
+{headline}
+
+ARTICLE:
+
+{article_excerpt}
+"""
+
+    try:
+
+        raw = ask_ai(
+            prompt,
+            purpose="headline analysis"
+        )
+
+        data = _extract_json(
+            raw
+        )
+
+        if not isinstance(
+            data,
+            dict
+        ):
+            raise ValueError(
+                "Invalid headline response."
+            )
+
+        return data
+
+    except Exception as e:
+
+        logging.error(
+            f"Headline analysis error: {e}"
+        )
+
+        return {
+            "headline": headline,
+            "bias": {
+                "status": "NO_CLEAR_INDICATORS",
+                "reason": (
+                    "Headline analysis "
+                    "was unavailable."
+                )
+            },
+            "misleading": {
+                "status": "NO_CLEAR_INDICATORS",
+                "reason": (
+                    "Headline analysis "
+                    "was unavailable."
+                )
+            },
+            "sensationalism": {
+                "status": "LOW",
+                "reason": (
+                    "Headline analysis "
+                    "was unavailable."
+                )
+            }
+        }
+
+
+# ============================================================
+# EXPLANATION
+# ============================================================
+
+def generate_explanation(
+    score: float | None,
+    claims: list[dict[str, Any]]
+) -> str:
+
+    counts = Counter(
+        claim.get(
+            "verification_result",
+            "UNVERIFIED"
+        )
+        for claim in claims
+    )
+
+    supported = counts.get(
+        "SUPPORTED",
+        0
+    )
+
+    partially_supported = counts.get(
+        "PARTIALLY_SUPPORTED",
+        0
+    )
+
+    unsupported = counts.get(
+        "UNSUPPORTED",
+        0
+    )
+
+    contradicted = counts.get(
+        "CONTRADICTED",
+        0
+    )
+
+    unverified = counts.get(
+        "UNVERIFIED",
+        0
+    )
+
+    summary = f"""
+Supported claims: {supported}
+Partially supported claims: {partially_supported}
+Unsupported claims: {unsupported}
+Contradicted claims: {contradicted}
+Unverified claims: {unverified}
+"""
+
+    if score is None:
+
+        return (
+            "The system could not calculate a trust "
+            "score because there was not enough usable "
+            "external evidence to verify a sufficient "
+            "number of the article's claims."
+            f"{summary}"
+        )
+
+    prompt = f"""
+Write a short, neutral explanation of the article audit.
+
+Do not use Markdown.
+
+Do not use:
+- bold
+- headings
+- bullet points
+- ALL CAPS
+
+Do not say that an UNVERIFIED claim is false.
+
+Explain that the trust score reflects how well the
+independently checkable claims were supported by the
+available external evidence.
+
+Trust score:
+{score}/100
+
+Claim results:
+{summary}
+
+Return only the explanation.
+"""
+
+    try:
+
+        result = ask_ai(
+            prompt,
+            purpose="trust score explanation"
+        )
+
+        return result.strip()
+
+    except Exception as e:
+
+        logging.error(
+            f"Explanation error: {e}"
+        )
+
+        return (
+            f"The article received a trust score of "
+            f"{score}/100 based on the available "
+            f"external evidence. "
+            f"{supported} claims were supported, "
+            f"{partially_supported} were partially "
+            f"supported, {unsupported} were unsupported, "
+            f"{contradicted} were contradicted, and "
+            f"{unverified} could not be verified."
+        )
+
+
+# ============================================================
+# FULL ARTICLE AUDIT
+# ============================================================
+
+def audit_article(
+    url: str
+) -> dict[str, Any]:
+
+    logging.info(
+        "=========================================="
+    )
+
+    logging.info(
+        "Starting article audit"
+    )
+
+    logging.info(
+        "=========================================="
+    )
+
+    # --------------------------------------------------------
+    # 1. FETCH ARTICLE
+    # --------------------------------------------------------
+
+    article = fetch_article(
+        url
+    )
+
+    article_text = article[
+        "text"
+    ]
+
+    headline = article[
+        "headline"
+    ]
+
+    logging.info(
+        f"Article text length: "
+        f"{len(article_text)} characters"
+    )
+
+    logging.info(
+        f"Headline: {headline}"
+    )
+
+    # --------------------------------------------------------
+    # 2. EXTRACT CLAIMS
+    # --------------------------------------------------------
+
+    claims = extract_claims(
+        article_text
+    )
+
+    logging.info(
+        f"Claims extracted: "
+        f"{len(claims)}"
+    )
+
+    if not claims:
+
+        raise RuntimeError(
+            "No factual claims could be extracted "
+            "from the article."
+        )
+
+    # --------------------------------------------------------
+    # 3. SEARCH + VERIFY CLAIMS
+    # --------------------------------------------------------
+
+    verified_claims = verify_claims(
+        claims
+    )
+
+    # --------------------------------------------------------
+    # 4. CALCULATE TRUST SCORE
+    # --------------------------------------------------------
+
+    score = calculate_score(
+        verified_claims
+    )
+
+    if score is None:
+
+        verification_status = (
+            "INSUFFICIENT_EVIDENCE"
+        )
+
+    else:
+
+        verification_status = (
+            "SCORED"
+        )
+
+    # --------------------------------------------------------
+    # 5. HEADLINE ANALYSIS
+    # --------------------------------------------------------
+
+    headline_analysis = analyze_headline(
+        headline,
+        article_text
+    )
+
+    # --------------------------------------------------------
+    # 6. EXPLANATION
+    # --------------------------------------------------------
+
+    explanation = generate_explanation(
+        score,
+        verified_claims
+    )
+
+    # --------------------------------------------------------
+    # 7. RESPONSE
+    # --------------------------------------------------------
+
+    return {
+        "url": url,
+        "headline": headline,
+        "trust_score": score,
+        "verification_status": (
+            verification_status
+        ),
+        "explanation": explanation,
+        "headline_analysis": (
+            headline_analysis
+        ),
+        "extracted_claims": (
+            verified_claims
+        ),
+        "claims": verified_claims
+    }
+
+
+# ============================================================
+# API ENDPOINT
+# ============================================================
+
+@app.post("/audit")
+def audit(
+    request: ArticleRequest
+) -> dict[str, Any]:
+
+    try:
+
+        return audit_article(
+            request.url
+        )
+
+    except Exception as e:
+
+        logging.error(
+            f"Audit endpoint error: {e}"
+        )
+
+        return {
+            "error": (
+                f"Article analysis failed: "
+                f"{str(e)}"
             )
         }
 
 
 # ============================================================
-# CREATE FASTAPI APP
+# SERVER
 # ============================================================
 
-app = FastAPI()
+if __name__ == "__main__":
 
-
-# ============================================================
-# CREATE AUDITOR
-# ============================================================
-
-auditor = OpenNewsAuditor()
-
-
-# ============================================================
-# FRONTEND SETUP
-# ============================================================
-
-app.mount(
-    "/static",
-    StaticFiles(directory="frontend"),
-    name="static"
-)
-
-
-# ============================================================
-# HOME PAGE
-# ============================================================
-
-@app.get("/")
-def home():
-
-    return FileResponse(
-        "frontend/index.html"
+    uvicorn.run(
+        "backend.main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True
     )
-
-
-# ============================================================
-# AUDIT ARTICLE
-# ============================================================
-
-@app.post("/audit")
-def audit_article(request: ArticleRequest):
-
-    # ========================================================
-    # FAKE ARTICLE FOR DESIGN TESTING
-    # ========================================================
-
-    if request.url == "https://example.com/news-article":
-
-        return {
-
-            "url": request.url,
-
-            "article": """
-The government announced a new policy on Monday.
-
-Officials stated that the policy will take effect next month
-and will affect several organizations.
-
-The announcement was made during a press conference in the capital.
-
-The government said the policy is intended to improve public services.
-""",
-
-            "llm_score": 82,
-
-            "explanation": (
-                "The article's main factual claims are generally "
-                "supported by identifiable information, although "
-                "some details remain insufficiently supported or "
-                "unverified. The score reflects the balance between "
-                "supported claims and the uncertainty surrounding "
-                "several claims."
-            ),
-
-            "extracted_claims": [
-
-                {
-                    "claim": "The government announced a new policy on Monday.",
-
-                    "type": "Fact",
-
-                    "entities": [
-                        "Government"
-                    ],
-
-                    "evidence_in_article":
-                        "The article states that the government announced a new policy on Monday.",
-
-                    "source_attribution":
-                        "Government officials",
-
-                    "verification_required":
-                        "Yes"
-                },
-
-                {
-                    "claim": "The policy will take effect next month.",
-
-                    "type": "Fact",
-
-                    "entities": [
-                        "Government",
-                        "Policy"
-                    ],
-
-                    "evidence_in_article":
-                        "Officials stated that the policy will take effect next month.",
-
-                    "source_attribution":
-                        "Government officials",
-
-                    "verification_required":
-                        "Yes"
-                },
-
-                {
-                    "claim": "The policy will affect several organizations.",
-
-                    "type": "Fact",
-
-                    "entities": [
-                        "Organizations",
-                        "Government"
-                    ],
-
-                    "evidence_in_article":
-                        "The article states that the policy will affect several organizations.",
-
-                    "source_attribution":
-                        "No specific source attribution.",
-
-                    "verification_required":
-                        "Yes"
-                },
-
-                {
-                    "claim":
-                        "The announcement was made during a press conference in the capital.",
-
-                    "type": "Fact",
-
-                    "entities": [
-                        "Government"
-                    ],
-
-                    "evidence_in_article":
-                        "The announcement was made during a press conference in the capital.",
-
-                    "source_attribution":
-                        "No specific source attribution.",
-
-                    "verification_required":
-                        "Yes"
-                },
-
-                {
-                    "claim":
-                        "The government said the policy is intended to improve public services.",
-
-                    "type": "Statement",
-
-                    "entities": [
-                        "Government"
-                    ],
-
-                    "evidence_in_article":
-                        "The government said the policy is intended to improve public services.",
-
-                    "source_attribution":
-                        "Government",
-
-                    "verification_required":
-                        "Yes"
-                }
-
-            ]
-        }
-
-
-    # ========================================================
-    # REAL ARTICLE
-    # ========================================================
-
-    try:
-
-        return auditor.audit(request.url)
-
-    except Exception as e:
-
-        return {
-
-            "url": request.url,
-
-            "error": f"Article analysis failed: {str(e)}"
-        }
-
-
-# ============================================================
-# DEMO DATA
-# ============================================================
-
-# This endpoint is ONLY for testing the frontend design.
-#
-# It does NOT:
-# - fetch a real article
-# - use Trafilatura
-# - call Groq
-#
-# Open:
-# http://127.0.0.1:8000/demo
-# ============================================================
-
-@app.get("/demo")
-def demo_audit():
-
-    return {
-
-        "url":
-            "https://example.com/news-article",
-
-
-        "article":
-            """
-The government announced a new policy on Monday.
-
-Officials stated that the policy will take effect next month
-and will affect several organizations.
-
-The announcement was made during a press conference in the capital.
-
-The government said the policy is intended to improve public services.
-""",
-
-
-        "llm_score":
-            82,
-
-
-        "explanation":
-            (
-                "The article's main factual claims are generally "
-                "supported by identifiable information, although "
-                "some details remain insufficiently supported or "
-                "unverified. The score reflects the balance between "
-                "supported claims and the uncertainty surrounding "
-                "several claims."
-            ),
-
-
-        "extracted_claims": [
-
-            {
-
-                "claim":
-                    "The government announced a new policy on Monday.",
-
-                "type":
-                    "Fact",
-
-                "entities": [
-                    "Government"
-                ],
-
-                "evidence_in_article":
-                    (
-                        "The article states that the government "
-                        "announced a new policy on Monday."
-                    ),
-
-                "source_attribution":
-                    "Government officials",
-
-                "verification_required":
-                    "Yes"
-            },
-
-
-            {
-
-                "claim":
-                    "The policy will take effect next month.",
-
-                "type":
-                    "Fact",
-
-                "entities": [
-                    "Government",
-                    "Policy"
-                ],
-
-                "evidence_in_article":
-                    (
-                        "Officials stated that the policy will "
-                        "take effect next month."
-                    ),
-
-                "source_attribution":
-                    "Government officials",
-
-                "verification_required":
-                    "Yes"
-            },
-
-
-            {
-
-                "claim":
-                    "The policy will affect several organizations.",
-
-                "type":
-                    "Fact",
-
-                "entities": [
-                    "Organizations",
-                    "Government"
-                ],
-
-                "evidence_in_article":
-                    (
-                        "The article states that the policy will "
-                        "affect several organizations."
-                    ),
-
-                "source_attribution":
-                    "No specific source attribution.",
-
-                "verification_required":
-                    "Yes"
-            },
-
-
-            {
-
-                "claim":
-                    (
-                        "The announcement was made during a press "
-                        "conference in the capital."
-                    ),
-
-                "type":
-                    "Fact",
-
-                "entities": [
-                    "Government"
-                ],
-
-                "evidence_in_article":
-                    (
-                        "The announcement was made during a press "
-                        "conference in the capital."
-                    ),
-
-                "source_attribution":
-                    "No specific source attribution.",
-
-                "verification_required":
-                    "Yes"
-            },
-
-
-            {
-
-                "claim":
-                    (
-                        "The government said the policy is intended "
-                        "to improve public services."
-                    ),
-
-                "type":
-                    "Statement",
-
-                "entities": [
-                    "Government"
-                ],
-
-                "evidence_in_article":
-                    (
-                        "The government said the policy is intended "
-                        "to improve public services."
-                    ),
-
-                "source_attribution":
-                    "Government",
-
-                "verification_required":
-                    "Yes"
-            }
-
-        ]
-    }
