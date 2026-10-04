@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import re
-import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -10,7 +9,6 @@ from typing import Any
 import requests
 import trafilatura
 import uvicorn
-
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -20,10 +18,7 @@ from groq import Groq
 from pydantic import BaseModel
 
 
-# ============================================================
-# OPTIONAL AI PROVIDERS
-# ============================================================
-
+# Alternative AI providers
 try:
     from google import genai
 except ImportError:
@@ -35,10 +30,7 @@ except ImportError:
     InferenceClient = None
 
 
-# ============================================================
-# LOGGING
-# ============================================================
-
+# Basic logging keeps useful information without excessive output.
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s: %(message)s"
@@ -48,10 +40,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
+# Load environment variables.
 load_dotenv()
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -59,25 +48,13 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 
-# ============================================================
-# AI MODEL SETTINGS
-# ============================================================
-
+# AI model configuration.
 GROQ_MODEL = "openai/gpt-oss-120b"
-
-# Current Gemini API model.
-GEMINI_MODEL = "gemini-3.8-flash"
-
-# Hugging Face model.
-# Hugging Face automatically selects an available inference
-# provider when provider="auto" is used.
+GEMINI_MODEL = "gemini-3.6-flash"
 HF_MODEL = "openai/gpt-oss-120b"
 
 
-# ============================================================
-# HTTP SETTINGS
-# ============================================================
-
+# Shared HTTP settings prevent repeated configuration.
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 "
@@ -95,19 +72,12 @@ DEFAULT_HEADERS = {
 
 DEFAULT_TIMEOUT = 15
 GOOGLE_NEWS_TIMEOUT = 15
-
 MAX_NEWS_RESULTS = 8
 MAX_EVIDENCE_SOURCES = 5
-
-# Do not score an article unless at least this percentage
-# of claims received usable external evidence.
 MINIMUM_EVIDENCE_COVERAGE = 0.50
 
 
-# ============================================================
-# VERIFICATION STATUS
-# ============================================================
-
+# Verification results used throughout the application.
 ALLOWED_STATUSES = {
     "SUPPORTED",
     "PARTIALLY_SUPPORTED",
@@ -124,19 +94,11 @@ STATUS_SCORES = {
 }
 
 
-# ============================================================
-# FASTAPI
-# ============================================================
-
-app = FastAPI(
-    title="OpenNews Auditor"
-)
+# FastAPI application.
+app = FastAPI(title="OpenNews Auditor")
 
 
-# ============================================================
-# FRONTEND
-# ============================================================
-
+# Frontend paths.
 BASE_DIR = Path(__file__).resolve().parent
 FRONTEND_DIR = BASE_DIR.parent / "frontend"
 
@@ -148,175 +110,104 @@ app.mount(
 
 
 @app.get("/")
-def home():
-    return FileResponse(
-        str(FRONTEND_DIR / "index.html")
-    )
+def home() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "index.html")
 
 
-# ============================================================
-# AI CLIENTS
-# ============================================================
-
+# AI clients are optional because fallback providers are supported.
 groq_client = None
 gemini_client = None
 hf_client = None
 
 
-if GROQ_API_KEY:
-    groq_client = Groq(
-        api_key=GROQ_API_KEY
-    )
-    logging.info("Groq API enabled.")
-else:
-    logging.warning(
-        "GROQ_API_KEY not found. Groq disabled."
-    )
+def initialize_ai_clients() -> None:
+    """Initialize every AI provider available in the .env file."""
+    global groq_client, gemini_client, hf_client
 
+    if GROQ_API_KEY:
+        try:
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            logging.info("Groq API enabled.")
+        except Exception as error:
+            logging.warning(f"Groq initialization failed: {error}")
+    else:
+        logging.warning("GROQ_API_KEY not found. Groq disabled.")
 
-if GEMINI_API_KEY and genai:
-    try:
-        gemini_client = genai.Client(
-            api_key=GEMINI_API_KEY
+    if GEMINI_API_KEY and genai:
+        try:
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+            logging.info("Gemini API enabled.")
+        except Exception as error:
+            logging.warning(f"Gemini initialization failed: {error}")
+
+    if HF_TOKEN and InferenceClient:
+        try:
+            hf_client = InferenceClient(
+                api_key=HF_TOKEN,
+                provider="auto"
+            )
+            logging.info("Hugging Face API enabled.")
+        except Exception as error:
+            logging.warning(
+                f"Hugging Face initialization failed: {error}"
+            )
+
+    if not any([groq_client, gemini_client, hf_client]):
+        raise ValueError(
+            "No AI provider is configured. "
+            "Add GROQ_API_KEY, GEMINI_API_KEY, or HF_TOKEN "
+            "to the .env file."
         )
-        logging.info("Gemini API enabled.")
-    except Exception as e:
-        logging.warning(
-            f"Gemini initialization failed: {e}"
-        )
 
 
-if HF_TOKEN and InferenceClient:
-    try:
-        hf_client = InferenceClient(
-            api_key=HF_TOKEN,
-            provider="auto"
-        )
-        logging.info(
-            "Hugging Face API enabled."
-        )
-    except Exception as e:
-        logging.warning(
-            f"Hugging Face initialization failed: {e}"
-        )
+initialize_ai_clients()
 
-
-if not any(
-    [
-        groq_client,
-        gemini_client,
-        hf_client
-    ]
-):
-    raise ValueError(
-        "No AI provider is configured. "
-        "Add GROQ_API_KEY, GEMINI_API_KEY, "
-        "or HF_TOKEN to the .env file."
-    )
-
-
-# ============================================================
-# REQUEST MODEL
-# ============================================================
 
 class ArticleRequest(BaseModel):
     url: str
 
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def _clean_json_markdown(text: str) -> str:
-    """
-    Remove Markdown code fences if an AI model returns JSON
-    inside ```json ... ```.
-    """
-
+def clean_json_markdown(text: str) -> str:
+    """Remove Markdown code fences around JSON."""
     if not text:
         return ""
 
     text = text.strip()
-
-    text = re.sub(
-        r"^```json\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"^```\s*",
-        "",
-        text
-    )
-
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text
-    )
+    text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^```\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
 
     return text.strip()
 
 
-def _extract_json(text: str) -> Any:
-    """
-    Safely extract JSON from an AI response.
-    """
-
-    cleaned = _clean_json_markdown(text)
+def extract_json(text: str) -> Any:
+    """Extract valid JSON even when the AI adds surrounding text."""
+    cleaned = clean_json_markdown(text)
 
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
         pass
 
-    # Try to find an object.
-    object_match = re.search(
-        r"\{.*\}",
-        cleaned,
-        flags=re.DOTALL
-    )
+    for opening, closing in [("{", "}"), ("[", "]")]:
+        start = cleaned.find(opening)
+        end = cleaned.rfind(closing)
 
-    if object_match:
+        if start == -1 or end == -1 or end <= start:
+            continue
+
         try:
-            return json.loads(
-                object_match.group(0)
-            )
+            return json.loads(cleaned[start:end + 1])
         except json.JSONDecodeError:
-            pass
+            continue
 
-    # Try to find an array.
-    array_match = re.search(
-        r"\[.*\]",
-        cleaned,
-        flags=re.DOTALL
-    )
+    raise ValueError("The AI response did not contain valid JSON.")
 
-    if array_match:
-        try:
-            return json.loads(
-                array_match.group(0)
-            )
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(
-        "The AI response did not contain valid JSON."
-    )
-
-
-# ============================================================
-# GROQ
-# ============================================================
 
 def ask_groq(prompt: str) -> str:
-
+    """Send a prompt to Groq."""
     if not groq_client:
-        raise RuntimeError(
-            "Groq is not configured."
-        )
+        raise RuntimeError("Groq is not configured.")
 
     response = groq_client.chat.completions.create(
         model=GROQ_MODEL,
@@ -332,23 +223,15 @@ def ask_groq(prompt: str) -> str:
     result = response.choices[0].message.content
 
     if not result:
-        raise ValueError(
-            "Groq returned an empty response."
-        )
+        raise ValueError("Groq returned an empty response.")
 
-    return _clean_json_markdown(result)
+    return clean_json_markdown(result)
 
-
-# ============================================================
-# GEMINI
-# ============================================================
 
 def ask_gemini(prompt: str) -> str:
-
+    """Send a prompt to Gemini."""
     if not gemini_client:
-        raise RuntimeError(
-            "Gemini is not configured."
-        )
+        raise RuntimeError("Gemini is not configured.")
 
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL,
@@ -358,23 +241,15 @@ def ask_gemini(prompt: str) -> str:
     result = response.text
 
     if not result:
-        raise ValueError(
-            "Gemini returned an empty response."
-        )
+        raise ValueError("Gemini returned an empty response.")
 
-    return _clean_json_markdown(result)
+    return clean_json_markdown(result)
 
-
-# ============================================================
-# HUGGING FACE
-# ============================================================
 
 def ask_huggingface(prompt: str) -> str:
-
+    """Send a prompt to Hugging Face."""
     if not hf_client:
-        raise RuntimeError(
-            "Hugging Face is not configured."
-        )
+        raise RuntimeError("Hugging Face is not configured.")
 
     response = hf_client.chat.completions.create(
         model=HF_MODEL,
@@ -395,62 +270,32 @@ def ask_huggingface(prompt: str) -> str:
             "Hugging Face returned an empty response."
         )
 
-    return _clean_json_markdown(result)
+    return clean_json_markdown(result)
 
-
-# ============================================================
-# UNIVERSAL AI FALLBACK
-# ============================================================
 
 def ask_ai(
     prompt: str,
     purpose: str = "AI analysis"
 ) -> str:
-    """
-    Try AI providers in this order:
-
-        1. Groq
-        2. Gemini
-        3. Hugging Face
-
-    If one provider fails, automatically try the next one.
-    """
-
+    """Try each configured AI provider until one succeeds."""
     providers = [
-        (
-            "Groq",
-            ask_groq,
-            groq_client
-        ),
-        (
-            "Gemini",
-            ask_gemini,
-            gemini_client
-        ),
-        (
-            "Hugging Face",
-            ask_huggingface,
-            hf_client
-        ),
+        ("Groq", ask_groq, groq_client),
+        ("Gemini", ask_gemini, gemini_client),
+        ("Hugging Face", ask_huggingface, hf_client),
     ]
 
     errors = []
 
     for provider_name, provider_function, client in providers:
-
         if not client:
             continue
 
         try:
-
             logging.info(
-                f"AI provider: {provider_name} "
-                f"for {purpose}"
+                f"AI provider: {provider_name} for {purpose}"
             )
 
-            result = provider_function(
-                prompt
-            )
+            result = provider_function(prompt)
 
             logging.info(
                 f"{provider_name} succeeded."
@@ -458,166 +303,96 @@ def ask_ai(
 
             return result
 
-        except Exception as e:
-
-            error_text = str(e)
-
+        except Exception as error:
+            error_text = str(error)
             errors.append(
                 f"{provider_name}: {error_text}"
             )
 
-            if "429" in error_text:
-
-                logging.warning(
-                    f"{provider_name} rate limit reached."
-                )
-
-            else:
-
-                logging.warning(
-                    f"{provider_name} failed: "
-                    f"{error_text}"
-                )
-
-            logging.info(
-                f"Trying next AI provider..."
+            logging.warning(
+                f"{provider_name} failed: {error_text}"
             )
 
     raise RuntimeError(
-        f"All AI providers failed for "
-        f"{purpose}. "
+        f"All AI providers failed for {purpose}. "
         f"Errors: {' | '.join(errors)}"
     )
 
-
-# ============================================================
-# ARTICLE EXTRACTION
-# ============================================================
-
-def fetch_article(
-    url: str
-) -> dict[str, str]:
-
-    logging.info(
-        f"Fetching article: {url}"
-    )
-
+#download the webpage 
+def fetch_url(url: str) -> str:
     try:
-
         response = requests.get(
-            url,
-            headers=DEFAULT_HEADERS,
-            timeout=DEFAULT_TIMEOUT
-        )
-
+            url,headers=DEFAULT_HEADERS,timeout=DEFAULT_TIMEOUT)
         response.raise_for_status()
-
-    except requests.RequestException as e:
-
+        return response.text
+    except requests.RequestException as error:
         raise RuntimeError(
-            f"Could not access article URL: {e}"
+            f"Could not access article URL: {error}"
         )
 
-    html = response.text
+# extracts the headline , do trafilatura first and if that fail use beautifulSoup
+def extract_headline(html: str) -> str:
+    try:
+        metadata = trafilatura.extract_metadata(html)
+        if metadata:
+            headline = getattr(metadata, "title", None)
 
-    article_text = trafilatura.extract(
-        html,
-        include_comments=False,
-        include_tables=False,
-        include_links=False,
-        favor_precision=True
+            if headline:
+                return headline
+    except Exception:
+        pass
+    soup = BeautifulSoup(html, "html.parser")
+    title_tag = soup.find("title")
+
+    return (
+        title_tag.get_text(" ", strip=True)
+        if title_tag
+        else ""
     )
 
-    # Fallback if Trafilatura does not extract enough text.
-    if not article_text or len(article_text) < 200:
+# when Trafilatura fail to extract this is activated 
+def fallback_extract_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(
+        ["script","style","noscript","nav","footer","header"]
+    ):
+        tag.decompose()
+    return soup.get_text(" ", strip=True)
 
-        logging.warning(
-            "Trafilatura extracted little text. "
-            "Trying fallback extraction."
-        )
+# extract the main article text
+def extract_article_text(html: str) -> str:
+    article_text = trafilatura.extract(
+        html,include_comments=False,include_tables=False,
+        include_links=False,favor_precision=True)
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
+    if article_text and len(article_text) >= 200:
+        return article_text
 
-        for tag in soup(
-            [
-                "script",
-                "style",
-                "noscript",
-                "nav",
-                "footer",
-                "header"
-            ]
-        ):
-            tag.decompose()
+    logging.warning(
+        "Trafilatura extracted little text. "
+        "Using fallback extraction."
+    )
 
-        article_text = soup.get_text(
-            " ",
-            strip=True
-        )
+    fallback_text = fallback_extract_text(html)
 
-    if not article_text:
+    if not fallback_text:
         raise RuntimeError(
             "Could not extract article text."
         )
 
-    headline = ""
+    return fallback_text
 
-    try:
-
-        metadata = trafilatura.extract_metadata(
-            html
-        )
-
-        if metadata:
-
-            headline = (
-                getattr(
-                    metadata,
-                    "title",
-                    None
-                )
-                or ""
-            )
-
-    except Exception:
-        pass
-
-    if not headline:
-
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
-
-        title_tag = soup.find(
-            "title"
-        )
-
-        if title_tag:
-            headline = title_tag.get_text(
-                " ",
-                strip=True
-            )
-
+# download and extract the article
+def fetch_article(url: str) -> dict[str, str]:
+    logging.info(f"Fetching article: {url}")
+    html = fetch_url(url)
     return {
-        "text": article_text,
-        "headline": headline,
-        "url": url
-    }
+        "text": extract_article_text(html),"headline": extract_headline(html),
+        "url": url}
 
-
-# ============================================================
-# CLAIM EXTRACTION
-# ============================================================
-
-def extract_claims(
+def extract_claims( # uses AI to extract the main claims 
     article_text: str
 ) -> list[dict[str, Any]]:
-
-    # Limit enormous articles.
     article_for_ai = article_text[:30000]
 
     prompt = f"""
@@ -660,155 +435,68 @@ ARTICLE:
 """
 
     try:
-
         raw = ask_ai(
             prompt,
             purpose="claim extraction"
         )
 
-        data = _extract_json(raw)
+        data = extract_json(raw)
 
         if isinstance(data, dict):
-
-            claims = data.get(
-                "claims",
-                []
-            )
-
+            claims = data.get("claims", [])
         elif isinstance(data, list):
-
             claims = data
-
         else:
-
             claims = []
 
-        if not isinstance(
-            claims,
-            list
-        ):
-            claims = []
+        return claims[:10] if isinstance(claims, list) else []
 
-        return claims[:10]
-
-    except Exception as e:
-
+    except Exception as error:
         logging.error(
-            f"Claim extraction error: {e}"
+            f"Claim extraction error: {error}"
         )
 
         raise RuntimeError(
-            "Could not extract factual claims "
-            "from the article."
+            "Could not extract factual claims from the article."
         )
 
-
-# ============================================================
-# LOCAL SEARCH QUERY GENERATOR
-# ============================================================
 
 def generate_search_query(
     claim: dict[str, Any]
 ) -> str:
-    """
-    Generate a simple search query locally.
-
-    IMPORTANT:
-    This no longer uses an AI call.
-
-    This reduces API usage significantly.
-    """
-
-    claim_text = claim.get(
-        "claim",
-        ""
-    )
+    """Build a search query locally without another AI call."""
+    claim_text = claim.get("claim", "")
 
     if not claim_text:
         return ""
 
-    # Important named entities first.
-    entities = claim.get(
-        "entities",
-        []
-    )
-
     query_parts = []
 
-    if isinstance(
-        entities,
-        list
-    ):
+    entities = claim.get("entities", [])
 
-        for entity in entities:
-
-            if not isinstance(
-                entity,
-                str
-            ):
-                continue
-
-            entity = entity.strip()
-
-            if entity and entity not in query_parts:
-
-                query_parts.append(
-                    entity
-                )
+    if isinstance(entities, list):
+        query_parts.extend(
+            entity.strip()
+            for entity in entities
+            if isinstance(entity, str)
+            and entity.strip()
+        )
 
     stop_words = {
-        "the",
-        "a",
-        "an",
-        "is",
-        "are",
-        "was",
-        "were",
-        "be",
-        "been",
-        "being",
-        "has",
-        "have",
-        "had",
-        "that",
-        "this",
-        "these",
-        "those",
-        "and",
-        "or",
-        "but",
-        "of",
-        "to",
-        "in",
-        "on",
-        "for",
-        "with",
-        "from",
-        "by",
-        "as",
-        "after",
-        "before",
-        "during",
-        "into",
-        "its",
-        "their",
-        "it",
-        "they",
-        "he",
-        "she",
-        "who",
-        "which",
-        "that",
-        "according",
-        "said"
+        "the", "a", "an", "is", "are", "was", "were",
+        "be", "been", "being", "has", "have", "had",
+        "that", "this", "these", "those", "and", "or",
+        "but", "of", "to", "in", "on", "for", "with",
+        "from", "by", "as", "after", "before", "during",
+        "into", "its", "their", "it", "they", "he",
+        "she", "who", "which", "according", "said"
     }
 
     words = claim_text.split()
 
     for word in words:
-
         cleaned = word.strip(
-            ".,!?;:()[]{}\"'“”‘’"
+            ".,!?;:()[]{}\\\"'“”‘’"
         )
 
         if not cleaned:
@@ -821,31 +509,16 @@ def generate_search_query(
             continue
 
         if cleaned not in query_parts:
-
-            query_parts.append(
-                cleaned
-            )
+            query_parts.append(cleaned)
 
         if len(query_parts) >= 10:
             break
 
-    return " ".join(
-        query_parts[:10]
-    )
+    return " ".join(query_parts[:10])
 
 
-# ============================================================
-# GOOGLE NEWS RSS
-# ============================================================
-
-def _fetch_google_news_articles(
-    query: str
-) -> list[dict[str, Any]]:
-
-    print(
-        "\nSearching Google News RSS..."
-    )
-
+def fetch_google_news(query: str) -> list[dict[str, Any]]:
+    """Search Google News RSS for external reports."""
     google_news_url = (
         "https://news.google.com/rss/search"
     )
@@ -858,7 +531,6 @@ def _fetch_google_news_articles(
     }
 
     try:
-
         response = requests.get(
             google_news_url,
             params=params,
@@ -866,19 +538,12 @@ def _fetch_google_news_articles(
             timeout=GOOGLE_NEWS_TIMEOUT
         )
 
-        print(
-            "Google News RSS HTTP status: "
-            f"{response.status_code}"
-        )
-
         response.raise_for_status()
 
-    except requests.RequestException as e:
-
+    except requests.RequestException as error:
         logging.error(
-            f"Google News RSS request error: {e}"
+            f"Google News RSS request error: {error}"
         )
-
         return []
 
     soup = BeautifulSoup(
@@ -889,93 +554,51 @@ def _fetch_google_news_articles(
     results = []
     seen_urls = set()
 
-    items = soup.find_all(
-        "item"
-    )
-
-    print(
-        "Google News articles found: "
-        f"{len(items)}"
-    )
-
-    for item in items:
-
-        title_tag = item.find(
-            "title"
-        )
-
-        link_tag = item.find(
-            "link"
-        )
-
-        description_tag = item.find(
-            "description"
-        )
-
-        source_tag = item.find(
-            "source"
-        )
-
-        pub_date_tag = item.find(
-            "pubDate"
-        )
+    for item in soup.find_all("item"):
+        title_tag = item.find("title")
+        link_tag = item.find("link")
 
         if not title_tag or not link_tag:
             continue
 
-        title = title_tag.get_text(
-            strip=True
-        )
+        google_url = link_tag.get_text(strip=True)
 
-        google_url = link_tag.get_text(
-            strip=True
-        )
+        if not google_url or google_url in seen_urls:
+            continue
+
+        seen_urls.add(google_url)
+
+        description_tag = item.find("description")
+        source_tag = item.find("source")
+        published_tag = item.find("pubDate")
 
         description = ""
 
         if description_tag:
-
             description = BeautifulSoup(
                 description_tag.get_text(),
                 "html.parser"
-            ).get_text(
-                " ",
-                strip=True
-            )
+            ).get_text(" ", strip=True)
 
-        source_name = ""
+        source = (
+            source_tag.get_text(strip=True)
+            if source_tag
+            else ""
+        )
 
-        if source_tag:
-
-            source_name = source_tag.get_text(
-                strip=True
-            )
-
-        published = ""
-
-        if pub_date_tag:
-
-            published = pub_date_tag.get_text(
-                strip=True
-            )
-
-        if not google_url:
-            continue
-
-        if google_url in seen_urls:
-            continue
-
-        seen_urls.add(
-            google_url
+        published = (
+            published_tag.get_text(strip=True)
+            if published_tag
+            else ""
         )
 
         results.append(
             {
-                "title": title,
+                "title": title_tag.get_text(strip=True),
                 "description": description,
                 "url": google_url,
                 "google_url": google_url,
-                "source": source_name,
+                "source": source,
                 "published": published,
                 "is_google_news_link": True
             }
@@ -987,240 +610,140 @@ def _fetch_google_news_articles(
     return results
 
 
-# ============================================================
-# NEWS SEARCH
-# ============================================================
-
 def search_news(
     claim: dict[str, Any]
 ) -> list[dict[str, Any]]:
+    """Search external news reports for one claim."""
+    claim_text = claim.get("claim", "")
 
-    claim_text = claim.get(
-        "claim",
-        ""
+    logging.info(
+        f"Checking claim: {claim_text}"
     )
 
-    print(
-        "\nChecking claim: "
-        f"{claim_text}"
-    )
+    search_query = generate_search_query(claim)
 
-    search_query = generate_search_query(
-        claim
-    )
-
-    print(
-        "Generated search query: "
-        f"{search_query}"
+    logging.info(
+        f"Generated search query: {search_query}"
     )
 
     if not search_query:
-
-        logging.warning(
-            "Empty search query."
-        )
-
         return []
 
-    articles = _fetch_google_news_articles(
-        search_query
-    )
+    articles = fetch_google_news(search_query)
 
-    print(
-        "Total unique articles collected: "
-        f"{len(articles)}"
+    logging.info(
+        f"Articles collected: {len(articles)}"
     )
 
     return articles
 
 
-# ============================================================
-# COLLECT EVIDENCE
-# ============================================================
+def build_google_news_evidence(
+    article: dict[str, Any]
+) -> dict[str, Any]:
+    """Convert Google News metadata into evidence."""
+    title = article.get("title", "")
+    source = article.get("source", "")
+    published = article.get("published", "")
+    description = article.get("description", "")
+
+    return {
+        "title": title,
+        "description": description,
+        "url": article.get("url", ""),
+        "source": source,
+        "published": published,
+        "text": (
+            f"Headline: {title}\n"
+            f"Publisher: {source}\n"
+            f"Published: {published}\n"
+            f"Description: {description}"
+        ),
+        "evidence_type": "Google News RSS metadata"
+    }
+
+
+def build_article_evidence(
+    article: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Download and extract evidence from a normal article."""
+    url = article.get("url", "")
+
+    if not url:
+        return None
+
+    try:
+        response = requests.get(
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=DEFAULT_TIMEOUT
+        )
+
+        response.raise_for_status()
+
+        text = trafilatura.extract(
+            response.text,
+            include_comments=False,
+            include_tables=False,
+            include_links=False,
+            favor_precision=True
+        )
+
+        if not text:
+            return None
+
+        return {
+            "title": article.get("title", ""),
+            "description": article.get("description", ""),
+            "url": url,
+            "source": article.get("source", ""),
+            "published": article.get("published", ""),
+            "text": text[:12000],
+            "evidence_type": "External article"
+        }
+
+    except requests.RequestException as error:
+        logging.warning(
+            f"Could not download evidence from {url}: {error}"
+        )
+        return None
+
 
 def collect_evidence(
     articles: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-
+    """Collect usable evidence from search results."""
     evidence = []
 
     for article in articles:
-
         if len(evidence) >= MAX_EVIDENCE_SOURCES:
             break
 
-        title = article.get(
-            "title",
-            ""
-        )
-
-        description = article.get(
-            "description",
-            ""
-        )
-
-        url = article.get(
-            "url",
-            ""
-        )
-
-        source_name = article.get(
-            "source",
-            ""
-        )
-
-        # ----------------------------------------------------
-        # GOOGLE NEWS RSS RESULT
-        # ----------------------------------------------------
-
-        if article.get(
-            "is_google_news_link"
-        ):
-
+        if article.get("is_google_news_link"):
             evidence.append(
-                {
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "source": source_name,
-                    "published": article.get(
-                        "published",
-                        ""
-                    ),
-                    "text": (
-                        f"Headline: {title}\n"
-                        f"Publisher: {source_name}\n"
-                        f"Published: "
-                        f"{article.get('published', '')}\n"
-                        f"Description: {description}"
-                    ),
-                    "evidence_type": (
-                        "Google News RSS metadata"
-                    )
-                }
+                build_google_news_evidence(article)
             )
-
             continue
 
-        # ----------------------------------------------------
-        # NORMAL ARTICLE URL
-        # ----------------------------------------------------
+        article_evidence = build_article_evidence(article)
 
-        try:
-
-            response = requests.get(
-                url,
-                headers=DEFAULT_HEADERS,
-                timeout=DEFAULT_TIMEOUT
-            )
-
-            response.raise_for_status()
-
-            text = trafilatura.extract(
-                response.text,
-                include_comments=False,
-                include_tables=False,
-                include_links=False,
-                favor_precision=True
-            )
-
-            if not text:
-                continue
-
-            evidence.append(
-                {
-                    "title": title,
-                    "description": description,
-                    "url": url,
-                    "source": source_name,
-                    "published": article.get(
-                        "published",
-                        ""
-                    ),
-                    "text": text[:12000],
-                    "evidence_type": "External article"
-                }
-            )
-
-        except Exception as e:
-
-            logging.warning(
-                f"Could not extract evidence "
-                f"from {url}: {e}"
-            )
+        if article_evidence:
+            evidence.append(article_evidence)
 
     return evidence
 
 
-# ============================================================
-# BATCH CLAIM VERIFICATION
-# ============================================================
-
-def verify_claims(
+def build_claim_evidence_text(
     claims: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
+) -> str:
+    """Format all claims and evidence for the batch AI request."""
+    sections = []
 
-    if not claims:
-        return []
+    for index, claim in enumerate(claims, start=1):
+        evidence = claim.get("_evidence", [])
 
-    prepared_claims = []
-
-    # --------------------------------------------------------
-    # SEARCH FOR EVIDENCE
-    # --------------------------------------------------------
-
-    for index, claim in enumerate(
-        claims,
-        start=1
-    ):
-
-        print(
-            f"\n========== CLAIM {index} =========="
-        )
-
-        articles = search_news(
-            claim
-        )
-
-        evidence = collect_evidence(
-            articles
-        )
-
-        claim_copy = dict(
-            claim
-        )
-
-        claim_copy["_evidence"] = evidence
-
-        prepared_claims.append(
-            claim_copy
-        )
-
-    # --------------------------------------------------------
-    # CREATE ONE BATCH PROMPT
-    # --------------------------------------------------------
-
-    claim_sections = []
-
-    for index, claim in enumerate(
-        prepared_claims,
-        start=1
-    ):
-
-        evidence = claim.get(
-            "_evidence",
-            []
-        )
-
-        evidence_sections = []
-
-        for evidence_index, item in enumerate(
-            evidence,
-            start=1
-        ):
-
-            evidence_sections.append(
-                f"""
+        evidence_sections = [
+            f"""
 Evidence {evidence_index}
 
 Evidence type:
@@ -1239,24 +762,21 @@ URL:
 {item.get('url', '')}
 
 Content:
-{item.get('text', '')[:7000]}
+{item.get('text', '')[:1000]}
 """
+            for evidence_index, item in enumerate(
+                evidence,
+                start=1
             )
+        ]
 
-        if not evidence_sections:
+        evidence_text = (
+            "\n".join(evidence_sections)
+            if evidence_sections
+            else "No usable external evidence was found."
+        )
 
-            evidence_text = (
-                "No usable external evidence "
-                "was found."
-            )
-
-        else:
-
-            evidence_text = "\n".join(
-                evidence_sections
-            )
-
-        claim_sections.append(
+        sections.append(
             f"""
 ==================================================
 CLAIM {index}
@@ -1282,55 +802,76 @@ External evidence:
 """
         )
 
-    all_claims_text = "\n".join(
-        claim_sections
-    )
+    return "\n".join(sections)
 
-    prompt = f"""
+
+def build_verification_prompt(
+    claims_text: str
+) -> str:
+    """Create the detailed claim verification prompt."""
+    return f"""
 You are the factual claim verification component of
 a news auditing system.
 
-Verify each claim using ONLY the external evidence
-provided below.
+Verify each claim using ONLY the external evidence provided below.
 
 Do not use your general world knowledge as evidence.
 
 IMPORTANT RULES:
 
-1. SUPPORTED means the evidence directly supports the
-   specific claim.
+1. SUPPORTED means the evidence directly confirms the main
+   factual claim and its important details.
 
-2. PARTIALLY_SUPPORTED means only part of the claim
-   is supported or important details are missing.
+2. PARTIALLY_SUPPORTED means the evidence confirms some
+   important parts of the claim, but does not confirm all
+   of its details.
 
-3. UNSUPPORTED means evidence was available but does
-   not support the claim.
+   For PARTIALLY_SUPPORTED, explain:
+   - what part is supported
+   - what part is not confirmed
+   - which evidence supports the conclusion
 
-4. CONTRADICTED means reliable evidence directly
-   conflicts with the claim.
+3. UNSUPPORTED means the available evidence does not provide
+   sufficient support for the claim.
 
-5. UNVERIFIED means there is not enough usable evidence
-   to determine whether the claim is supported.
+4. CONTRADICTED means reliable evidence directly conflicts
+   with the claim.
+
+5. UNVERIFIED means there is not enough usable evidence to
+   determine whether the claim is supported.
 
 6. Lack of evidence does NOT automatically mean false.
 
 7. A Google News RSS headline alone is weak evidence.
-   Do not treat a headline as complete proof of a claim.
 
 8. Do not invent facts.
 
-9. Do not assume multiple articles repeating the same
-   statement independently verify it.
+9. Do not assume multiple articles repeating the same statement
+   independently verify it.
 
-10. Compare exact details such as:
-    - people
-    - places
-    - dates
-    - numbers
-    - organizations
-    - events
-    - relationships
-    - actions
+10. Compare exact details such as people, places, dates,
+    numbers, organizations, events, relationships, and actions.
+
+11. The reason MUST be specific to the individual claim.
+
+12. Do NOT use the same generic reason for multiple claims
+    when the evidence differs.
+
+13. The reason should normally be 1-3 sentences.
+
+14. For PARTIALLY_SUPPORTED claims, explicitly identify both
+    the supported portion and the missing or unconfirmed portion.
+
+15. For SUPPORTED claims, explain which evidence directly
+    confirms the important details.
+
+16. For UNSUPPORTED claims, explain why the provided evidence
+    does not establish the claim.
+
+17. For CONTRADICTED claims, explain the specific conflict.
+
+18. For UNVERIFIED claims, explain that the available evidence
+    was insufficient and do not call the claim false.
 
 Return ONLY valid JSON.
 
@@ -1341,7 +882,7 @@ Use exactly this structure:
     {{
       "claim_index": 1,
       "status": "SUPPORTED",
-      "reason": "Short factual explanation.",
+      "reason": "Detailed claim-specific explanation.",
       "supporting_sources": [
         "Publisher name"
       ]
@@ -1349,7 +890,7 @@ Use exactly this structure:
   ]
 }}
 
-Allowed status values:
+Allowed statuses:
 
 SUPPORTED
 PARTIALLY_SUPPORTED
@@ -1359,79 +900,86 @@ UNVERIFIED
 
 CLAIMS AND EVIDENCE:
 
-{all_claims_text}
+{claims_text}
 """
 
-    # --------------------------------------------------------
-    # ASK AI
-    # --------------------------------------------------------
 
-    try:
+def verify_claims(
+    claims: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Search for evidence and verify claims in small AI batches."""
+    if not claims:
+        return []
 
-        raw = ask_ai(
-            prompt,
-            purpose="batch claim verification"
+    prepared_claims = []
+
+    for index, claim in enumerate(claims, start=1):
+        logging.info(f"Searching evidence for claim {index}.")
+
+        articles = search_news(claim)
+        evidence = collect_evidence(articles)
+
+        claim_copy = dict(claim)
+        claim_copy["_evidence"] = evidence
+        prepared_claims.append(claim_copy)
+
+    # Keep verification requests small enough for the AI provider limits.
+    batch_size = 3
+    all_verifications = {}
+
+    for batch_start in range(0, len(prepared_claims), batch_size):
+        batch = prepared_claims[
+            batch_start:batch_start + batch_size
+        ]
+
+        first_claim_number = batch_start + 1
+        last_claim_number = batch_start + len(batch)
+
+        logging.info(
+            f"Verifying claims {first_claim_number}-{last_claim_number}."
         )
 
-        data = _extract_json(
-            raw
-        )
-
-        if isinstance(
-            data,
-            dict
-        ):
-
-            verifications = data.get(
-                "verifications",
-                []
-            )
-
-        elif isinstance(
-            data,
-            list
-        ):
-
-            verifications = data
-
-        else:
-
-            verifications = []
-
-    except Exception as e:
-
-        logging.error(
-            f"Batch verification error: {e}"
-        )
-
-        verifications = []
-
-    # --------------------------------------------------------
-    # INDEX AI RESULTS
-    # --------------------------------------------------------
-
-    verification_map = {}
-
-    for item in verifications:
+        claims_text = build_claim_evidence_text(batch)
 
         try:
-
-            claim_index = int(
-                item.get(
-                    "claim_index"
+            raw = ask_ai(
+                build_verification_prompt(claims_text),
+                purpose=(
+                    f"batch claim verification "
+                    f"({first_claim_number}-{last_claim_number})"
                 )
             )
 
-            verification_map[
-                claim_index
-            ] = item
+            data = extract_json(raw)
 
-        except Exception:
-            continue
+            if isinstance(data, dict):
+                verifications = data.get("verifications", [])
+            elif isinstance(data, list):
+                verifications = data
+            else:
+                verifications = []
 
-    # --------------------------------------------------------
-    # BUILD FINAL CLAIM RESULTS
-    # --------------------------------------------------------
+        except Exception as error:
+            logging.error(
+                f"Batch verification error for claims "
+                f"{first_claim_number}-{last_claim_number}: {error}"
+            )
+            verifications = []
+
+        # AI claim indexes are local to the current batch. Convert them
+        # back to the original claim indexes before combining the results.
+        for item in verifications:
+            try:
+                local_index = int(item.get("claim_index"))
+
+                if not 1 <= local_index <= len(batch):
+                    continue
+
+                global_index = batch_start + local_index
+                all_verifications[global_index] = item
+
+            except (TypeError, ValueError, AttributeError):
+                continue
 
     verified_claims = []
 
@@ -1439,32 +987,20 @@ CLAIMS AND EVIDENCE:
         prepared_claims,
         start=1
     ):
+        evidence = claim.pop("_evidence", [])
 
-        evidence = claim.pop(
-            "_evidence",
-            []
-        )
-
-        verification = (
-            verification_map.get(
-                index
-            )
-        )
-
-        if not verification:
-
-            verification = {
+        verification = all_verifications.get(
+            index,
+            {
                 "claim_index": index,
-                "status": (
-                    "UNVERIFIED"
-                ),
+                "status": "UNVERIFIED",
                 "reason": (
-                    "The AI verification "
-                    "service could not "
-                    "evaluate this claim."
+                    "The AI verification service "
+                    "could not evaluate this claim."
                 ),
                 "supporting_sources": []
             }
+        )
 
         status = str(
             verification.get(
@@ -1474,167 +1010,119 @@ CLAIMS AND EVIDENCE:
         ).upper().strip()
 
         if status not in ALLOWED_STATUSES:
-
             status = "UNVERIFIED"
 
-        verification["status"] = status
+        reason = str(
+            verification.get(
+                "reason",
+                ""
+            )
+        ).strip()
 
-        claim["verification"] = (
-            verification
+        if not reason:
+            reason = (
+                "No detailed explanation was "
+                "provided for this verification result."
+            )
+
+        supporting_sources = verification.get(
+            "supporting_sources",
+            []
         )
 
-        claim["verification_result"] = (
-            status
-        )
+        if not isinstance(supporting_sources, list):
+            supporting_sources = []
 
-        claim["evidence_count"] = (
-            len(evidence)
-        )
-
-        claim["evidence_sources"] = [
+        verification.update(
             {
-                "title": item.get(
-                    "title",
-                    ""
-                ),
-                "source": item.get(
-                    "source",
-                    ""
-                ),
-                "published": item.get(
-                    "published",
-                    ""
-                ),
-                "url": item.get(
-                    "url",
-                    ""
-                ),
-                "evidence_type": item.get(
-                    "evidence_type",
-                    ""
-                )
+                "claim_index": index,
+                "status": status,
+                "reason": reason,
+                "supporting_sources": supporting_sources
             }
-            for item in evidence
-        ]
-
-        verified_claims.append(
-            claim
         )
+
+        claim.update(
+            {
+                "verification": verification,
+                "verification_result": status,
+                "verification_reason": reason,
+                "evidence_count": len(evidence),
+                "evidence_sources": [
+                    {
+                        "title": item.get("title", ""),
+                        "source": item.get("source", ""),
+                        "published": item.get("published", ""),
+                        "url": item.get("url", ""),
+                        "evidence_type": item.get(
+                            "evidence_type",
+                            ""
+                        )
+                    }
+                    for item in evidence
+                ]
+            }
+        )
+
+        verified_claims.append(claim)
 
     return verified_claims
 
 
-# ============================================================
-# TRUST SCORE
-# ============================================================
-
 def calculate_score(
     claims: list[dict[str, Any]]
 ) -> float | None:
-
+    """Calculate the trust score only when enough evidence exists."""
     if not claims:
         return None
 
-    scored_claims = []
-
-    for claim in claims:
-
-        status = claim.get(
-            "verification_result",
-            "UNVERIFIED"
+    scored_claims = [
+        (
+            claim.get("verification_result"),
+            1.25 if len(
+                claim.get("claim", "")
+            ) > 150 else 1.0
         )
+        for claim in claims
+        if claim.get("verification_result") in STATUS_SCORES
+    ]
 
-        if status not in STATUS_SCORES:
-            continue
-
-        claim_text = claim.get(
-            "claim",
-            ""
-        )
-
-        # Longer factual claims often contain more
-        # independently checkable information.
-        weight = (
-            1.25
-            if len(claim_text) > 150
-            else 1.0
-        )
-
-        scored_claims.append(
-            (
-                status,
-                weight
-            )
-        )
-
-    total_claims = len(
-        claims
-    )
-
-    verified_claim_count = len(
-        scored_claims
-    )
-
-    evidence_coverage = (
-        verified_claim_count
-        / total_claims
-    )
+    coverage = len(scored_claims) / len(claims)
 
     logging.info(
         f"Evidence coverage: "
-        f"{verified_claim_count}/"
-        f"{total_claims} "
-        f"({evidence_coverage:.0%})"
+        f"{len(scored_claims)}/{len(claims)} "
+        f"({coverage:.0%})"
     )
 
-    # Not enough external evidence to responsibly
-    # calculate a trust score.
-    if evidence_coverage < MINIMUM_EVIDENCE_COVERAGE:
-
+    if coverage < MINIMUM_EVIDENCE_COVERAGE:
         logging.warning(
-            "Insufficient evidence for "
-            "trust score."
+            "Insufficient evidence for trust score."
         )
-
         return None
 
-    weighted_total = 0.0
-    total_weight = 0.0
+    weighted_total = sum(
+        STATUS_SCORES[status] * weight
+        for status, weight in scored_claims
+    )
 
-    for status, weight in scored_claims:
-
-        weighted_total += (
-            STATUS_SCORES[status]
-            * weight
-        )
-
-        total_weight += weight
-
-    if total_weight == 0:
-        return None
-
-    score = (
-        weighted_total
-        / total_weight
+    total_weight = sum(
+        weight
+        for _, weight in scored_claims
     )
 
     return round(
-        score,
+        weighted_total / total_weight,
         1
-    )
+    ) if total_weight else None
 
-
-# ============================================================
-# HEADLINE ANALYSIS
-# ============================================================
 
 def analyze_headline(
     headline: str,
     article_text: str
 ) -> dict[str, Any]:
-
+    """Analyze headline bias, misleading presentation, and sensationalism."""
     if not headline:
-
         return {
             "headline": "",
             "bias": {
@@ -1651,13 +1139,10 @@ def analyze_headline(
             }
         }
 
-    article_excerpt = article_text[:12000]
-
     prompt = f"""
 You are analyzing a news headline for an auditing system.
 
-Analyze the headline only in relation to the article content
-provided below.
+Analyze the headline only in relation to the article content.
 
 Do NOT determine whether the article is true or false.
 
@@ -1668,20 +1153,11 @@ Do NOT infer political affiliation.
 Look for:
 
 1. Potential bias
-   Does the wording frame a person, organization, event,
-   or issue in a noticeably positive or negative way?
-
 2. Potentially misleading presentation
-   Does the headline omit or distort important context
-   compared with the article?
-
 3. Sensationalism
-   Does the wording use dramatic, exaggerated, emotional,
-   or attention-seeking language?
 
-Important:
-A single negative or positive word does not automatically
-mean the headline is biased.
+A single negative or positive word does not automatically mean
+the headline is biased.
 
 Return ONLY valid JSON.
 
@@ -1725,71 +1201,51 @@ HEADLINE:
 
 ARTICLE:
 
-{article_excerpt}
+{article_text[:12000]}
 """
 
     try:
-
         raw = ask_ai(
             prompt,
             purpose="headline analysis"
         )
 
-        data = _extract_json(
-            raw
-        )
+        data = extract_json(raw)
 
-        if not isinstance(
-            data,
-            dict
-        ):
+        if not isinstance(data, dict):
             raise ValueError(
                 "Invalid headline response."
             )
 
         return data
 
-    except Exception as e:
-
+    except Exception as error:
         logging.error(
-            f"Headline analysis error: {e}"
+            f"Headline analysis error: {error}"
         )
 
         return {
             "headline": headline,
             "bias": {
                 "status": "NO_CLEAR_INDICATORS",
-                "reason": (
-                    "Headline analysis "
-                    "was unavailable."
-                )
+                "reason": "Headline analysis was unavailable."
             },
             "misleading": {
                 "status": "NO_CLEAR_INDICATORS",
-                "reason": (
-                    "Headline analysis "
-                    "was unavailable."
-                )
+                "reason": "Headline analysis was unavailable."
             },
             "sensationalism": {
                 "status": "LOW",
-                "reason": (
-                    "Headline analysis "
-                    "was unavailable."
-                )
+                "reason": "Headline analysis was unavailable."
             }
         }
 
-
-# ============================================================
-# EXPLANATION
-# ============================================================
 
 def generate_explanation(
     score: float | None,
     claims: list[dict[str, Any]]
 ) -> str:
-
+    """Generate the overall explanation shown above claim details."""
     counts = Counter(
         claim.get(
             "verification_result",
@@ -1798,273 +1254,163 @@ def generate_explanation(
         for claim in claims
     )
 
-    supported = counts.get(
-        "SUPPORTED",
-        0
-    )
-
+    supported = counts.get("SUPPORTED", 0)
     partially_supported = counts.get(
         "PARTIALLY_SUPPORTED",
         0
     )
-
-    unsupported = counts.get(
-        "UNSUPPORTED",
-        0
-    )
-
-    contradicted = counts.get(
-        "CONTRADICTED",
-        0
-    )
-
-    unverified = counts.get(
-        "UNVERIFIED",
-        0
-    )
-
-    summary = f"""
-Supported claims: {supported}
-Partially supported claims: {partially_supported}
-Unsupported claims: {unsupported}
-Contradicted claims: {contradicted}
-Unverified claims: {unverified}
-"""
+    unsupported = counts.get("UNSUPPORTED", 0)
+    contradicted = counts.get("CONTRADICTED", 0)
+    unverified = counts.get("UNVERIFIED", 0)
 
     if score is None:
-
         return (
-            "The system could not calculate a trust "
-            "score because there was not enough usable "
-            "external evidence to verify a sufficient "
-            "number of the article's claims."
-            f"{summary}"
+            "The system could not calculate a trust score because "
+            "there was not enough usable external evidence to "
+            "verify a sufficient number of the article's claims. "
+            f"{supported} claims were supported, "
+            f"{partially_supported} were partially supported, "
+            f"{unsupported} were unsupported, "
+            f"{contradicted} were contradicted, and "
+            f"{unverified} could not be verified."
         )
 
     prompt = f"""
 Write a short, neutral explanation of the article audit.
 
-Do not use Markdown.
-
-Do not use:
-- bold
-- headings
-- bullet points
-- ALL CAPS
+Do not use Markdown, headings, bullet points, bold text, or ALL CAPS.
 
 Do not say that an UNVERIFIED claim is false.
 
-Explain that the trust score reflects how well the
-independently checkable claims were supported by the
-available external evidence.
+Explain that the trust score reflects how well the independently
+checkable claims were supported by the available external evidence.
 
-Trust score:
-{score}/100
+The detailed explanation for each individual claim is displayed
+separately, so summarize the overall result without repeating
+every claim.
 
-Claim results:
-{summary}
+Trust score: {score}/100
+
+Supported claims: {supported}
+Partially supported claims: {partially_supported}
+Unsupported claims: {unsupported}
+Contradicted claims: {contradicted}
+Unverified claims: {unverified}
 
 Return only the explanation.
 """
 
     try:
-
-        result = ask_ai(
+        return ask_ai(
             prompt,
             purpose="trust score explanation"
-        )
+        ).strip()
 
-        return result.strip()
-
-    except Exception as e:
-
+    except Exception as error:
         logging.error(
-            f"Explanation error: {e}"
+            f"Explanation error: {error}"
         )
 
         return (
-            f"The article received a trust score of "
-            f"{score}/100 based on the available "
-            f"external evidence. "
+            f"The article received a trust score of {score}/100 "
+            "based on the available external evidence. "
             f"{supported} claims were supported, "
-            f"{partially_supported} were partially "
-            f"supported, {unsupported} were unsupported, "
+            f"{partially_supported} were partially supported, "
+            f"{unsupported} were unsupported, "
             f"{contradicted} were contradicted, and "
             f"{unverified} could not be verified."
         )
 
 
-# ============================================================
-# FULL ARTICLE AUDIT
-# ============================================================
-
 def audit_article(
     url: str
 ) -> dict[str, Any]:
+    """Run the complete article auditing pipeline."""
+    logging.info("Starting article audit.")
+
+    article = fetch_article(url)
+
+    article_text = article["text"]
+    headline = article["headline"]
 
     logging.info(
-        "=========================================="
+        f"Article text length: {len(article_text)} characters."
     )
+
+    claims = extract_claims(article_text)
 
     logging.info(
-        "Starting article audit"
-    )
-
-    logging.info(
-        "=========================================="
-    )
-
-    # --------------------------------------------------------
-    # 1. FETCH ARTICLE
-    # --------------------------------------------------------
-
-    article = fetch_article(
-        url
-    )
-
-    article_text = article[
-        "text"
-    ]
-
-    headline = article[
-        "headline"
-    ]
-
-    logging.info(
-        f"Article text length: "
-        f"{len(article_text)} characters"
-    )
-
-    logging.info(
-        f"Headline: {headline}"
-    )
-
-    # --------------------------------------------------------
-    # 2. EXTRACT CLAIMS
-    # --------------------------------------------------------
-
-    claims = extract_claims(
-        article_text
-    )
-
-    logging.info(
-        f"Claims extracted: "
-        f"{len(claims)}"
+        f"Claims extracted: {len(claims)}."
     )
 
     if not claims:
-
         raise RuntimeError(
-            "No factual claims could be extracted "
-            "from the article."
+            "No factual claims could be extracted from the article."
         )
 
-    # --------------------------------------------------------
-    # 3. SEARCH + VERIFY CLAIMS
-    # --------------------------------------------------------
-
-    verified_claims = verify_claims(
-        claims
-    )
-
-    # --------------------------------------------------------
-    # 4. CALCULATE TRUST SCORE
-    # --------------------------------------------------------
+    verified_claims = verify_claims(claims)
 
     score = calculate_score(
         verified_claims
     )
 
-    if score is None:
-
-        verification_status = (
-            "INSUFFICIENT_EVIDENCE"
-        )
-
-    else:
-
-        verification_status = (
-            "SCORED"
-        )
-
-    # --------------------------------------------------------
-    # 5. HEADLINE ANALYSIS
-    # --------------------------------------------------------
+    verification_status = (
+        "SCORED"
+        if score is not None
+        else "INSUFFICIENT_EVIDENCE"
+    )
 
     headline_analysis = analyze_headline(
         headline,
         article_text
     )
 
-    # --------------------------------------------------------
-    # 6. EXPLANATION
-    # --------------------------------------------------------
-
     explanation = generate_explanation(
         score,
         verified_claims
     )
 
-    # --------------------------------------------------------
-    # 7. RESPONSE
-    # --------------------------------------------------------
-
     return {
         "url": url,
         "headline": headline,
         "trust_score": score,
-        "verification_status": (
-            verification_status
-        ),
+        "verification_status": verification_status,
         "explanation": explanation,
-        "headline_analysis": (
-            headline_analysis
-        ),
-        "extracted_claims": (
-            verified_claims
-        ),
+        "headline_analysis": headline_analysis,
+        "extracted_claims": verified_claims,
         "claims": verified_claims
     }
 
-
-# ============================================================
-# API ENDPOINT
-# ============================================================
 
 @app.post("/audit")
 def audit(
     request: ArticleRequest
 ) -> dict[str, Any]:
-
+    """FastAPI endpoint used by the frontend."""
     try:
-
         return audit_article(
             request.url
         )
 
-    except Exception as e:
-
+    except Exception as error:
         logging.error(
-            f"Audit endpoint error: {e}"
+            f"Audit endpoint error: {error}"
         )
 
         return {
-            "error": (
-                f"Article analysis failed: "
-                f"{str(e)}"
-            )
+            "error": f"Article analysis failed: {error}"
         }
 
 
-# ============================================================
-# SERVER
-# ============================================================
-
-if __name__ == "__main__":
-
+def main() -> None:
+    """Start the FastAPI development server."""
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
         port=8000,
         reload=True
     )
+
+
+if __name__ == "__main__":
+    main()

@@ -10,7 +10,6 @@ document.addEventListener("DOMContentLoaded", function () {
     // ====================================================
 
     function cleanText(value) {
-
         if (!value) {
             return "";
         }
@@ -23,7 +22,7 @@ document.addEventListener("DOMContentLoaded", function () {
             // Remove Markdown headings
             .replace(/^#{1,6}\s*/gm, "")
 
-            // Remove bullet points
+            // Remove Markdown bullet points
             .replace(/^\s*[-•]\s*/gm, "")
 
             // Remove underscores used as Markdown
@@ -47,16 +46,6 @@ document.addEventListener("DOMContentLoaded", function () {
         }
 
         let label = cleanText(value);
-
-        // Convert:
-        // POTENTIAL_BIAS
-        // NO_CLEAR_INDICATORS
-        // LOW
-        //
-        // into:
-        // Potential Bias
-        // No Clear Indicators
-        // Low
 
         label = label
             .replace(/[_-]+/g, " ")
@@ -85,7 +74,6 @@ document.addEventListener("DOMContentLoaded", function () {
             possibleScore !== undefined &&
             possibleScore !== null
         ) {
-
             const number = Number(possibleScore);
 
             if (!Number.isNaN(number)) {
@@ -113,6 +101,167 @@ document.addEventListener("DOMContentLoaded", function () {
 
 
     // ====================================================
+    // FORMAT SOURCE LIST
+    // ====================================================
+
+    function formatSources(supportingSources) {
+
+        if (
+            !Array.isArray(supportingSources) ||
+            supportingSources.length === 0
+        ) {
+            return `
+                <div class="claim-sources">
+                    <strong>Supporting Sources:</strong>
+                    <span>
+                        No specific supporting sources
+                        were identified.
+                    </span>
+                </div>
+            `;
+        }
+
+        const sources = supportingSources
+            .filter(function (source) {
+                return (
+                    source !== null &&
+                    source !== undefined &&
+                    String(source).trim() !== ""
+                );
+            })
+            .map(function (source) {
+
+                return `
+                    <span class="source-tag">
+                        ${escapeHtml(source)}
+                    </span>
+                `;
+
+            })
+            .join("");
+
+        if (!sources) {
+            return `
+                <div class="claim-sources">
+                    <strong>Supporting Sources:</strong>
+                    <span>
+                        No specific supporting sources
+                        were identified.
+                    </span>
+                </div>
+            `;
+        }
+
+        return `
+            <div class="claim-sources">
+                <strong>Supporting Sources:</strong>
+
+                <div class="source-list">
+                    ${sources}
+                </div>
+            </div>
+        `;
+    }
+
+
+    // ====================================================
+    // FORMAT DETAIL LIST
+    // ====================================================
+
+    function formatDetailList(title, details) {
+
+        if (
+            !Array.isArray(details) ||
+            details.length === 0
+        ) {
+            return "";
+        }
+
+        const items = details
+            .filter(function (item) {
+                return (
+                    item !== null &&
+                    item !== undefined &&
+                    String(item).trim() !== ""
+                );
+            })
+            .map(function (item) {
+                return `
+                    <li>
+                        ${escapeHtml(cleanText(item))}
+                    </li>
+                `;
+            })
+            .join("");
+
+        if (!items) {
+            return "";
+        }
+
+        return `
+            <div class="claim-detail-list">
+                <strong>${escapeHtml(title)}</strong>
+
+                <ul>
+                    ${items}
+                </ul>
+            </div>
+        `;
+    }
+
+
+    // ====================================================
+    // FORMAT EXPLANATION
+    // ====================================================
+
+    function formatExplanation(text) {
+
+        if (!text) {
+            return `
+                <p>
+                    No explanation available.
+                </p>
+            `;
+        }
+
+        const cleaned = String(text)
+            .replace(/\*\*/g, "")
+            .replace(/\*/g, "")
+            .replace(/^#{1,6}\s*/gm, "")
+            .replace(/^\s*[-•]\s*/gm, "")
+            .trim();
+
+        const sections = cleaned
+            .split(/\n\s*\n/)
+            .filter(function (section) {
+                return section.trim() !== "";
+            });
+
+        if (sections.length === 0) {
+            return `
+                <p>
+                    ${escapeHtml(cleanText(text))}
+                </p>
+            `;
+        }
+
+        return sections
+            .map(function (section) {
+                return `
+                    <p>
+                        ${escapeHtml(
+                            section
+                                .replace(/\s+/g, " ")
+                                .trim()
+                        )}
+                    </p>
+                `;
+            })
+            .join("");
+    }
+
+
+    // ====================================================
     // SEARCH / AUDIT FUNCTION
     // ====================================================
 
@@ -128,7 +277,9 @@ document.addEventListener("DOMContentLoaded", function () {
         if (!urlInput) {
 
             resultDiv.innerHTML = `
-                <p>Please enter a URL.</p>
+                <p>
+                    Please enter a URL.
+                </p>
             `;
 
             return;
@@ -140,7 +291,9 @@ document.addEventListener("DOMContentLoaded", function () {
         // =================================================
 
         resultDiv.innerHTML = `
-            <p>Analyzing article...</p>
+            <p>
+                Analyzing article...
+            </p>
         `;
 
 
@@ -150,19 +303,20 @@ document.addEventListener("DOMContentLoaded", function () {
             // SEND URL TO BACKEND
             // =============================================
 
-            const response = await fetch("/audit", {
+            const response = await fetch(
+                "/audit",
+                {
+                    method: "POST",
 
-                method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
 
-                headers: {
-                    "Content-Type": "application/json"
-                },
-
-                body: JSON.stringify({
-                    url: urlInput
-                })
-
-            });
+                    body: JSON.stringify({
+                        url: urlInput
+                    })
+                }
+            );
 
 
             // =============================================
@@ -171,14 +325,20 @@ document.addEventListener("DOMContentLoaded", function () {
 
             const data = await response.json();
 
-            console.log("Backend response:", data);
+            console.log(
+                "Backend response:",
+                data
+            );
 
 
             // =============================================
             // BACKEND ERROR
             // =============================================
 
-            if (!response.ok || data.error) {
+            if (
+                !response.ok ||
+                data.error
+            ) {
 
                 resultDiv.innerHTML = `
                     <p>
@@ -205,7 +365,8 @@ document.addEventListener("DOMContentLoaded", function () {
             // =============================================
 
             const verificationStatus =
-                data.verification_status || null;
+                data.verification_status ||
+                null;
 
 
             // =============================================
@@ -247,17 +408,19 @@ document.addEventListener("DOMContentLoaded", function () {
                 headlineAnalysis.bias ||
                 {};
 
-            const biasStatus = formatLabel(
-                bias.status ||
-                bias.label ||
-                "Not analyzed"
-            );
+            const biasStatus =
+                formatLabel(
+                    bias.status ||
+                    bias.label ||
+                    "Not analyzed"
+                );
 
-            const biasReason = cleanText(
-                bias.reason ||
-                bias.explanation ||
-                "No bias analysis available."
-            );
+            const biasReason =
+                cleanText(
+                    bias.reason ||
+                    bias.explanation ||
+                    "No bias analysis available."
+                );
 
 
             // =============================================
@@ -268,17 +431,19 @@ document.addEventListener("DOMContentLoaded", function () {
                 headlineAnalysis.misleading ||
                 {};
 
-            const misleadingStatus = formatLabel(
-                misleading.status ||
-                misleading.label ||
-                "Not analyzed"
-            );
+            const misleadingStatus =
+                formatLabel(
+                    misleading.status ||
+                    misleading.label ||
+                    "Not analyzed"
+                );
 
-            const misleadingReason = cleanText(
-                misleading.reason ||
-                misleading.explanation ||
-                "No misleading analysis available."
-            );
+            const misleadingReason =
+                cleanText(
+                    misleading.reason ||
+                    misleading.explanation ||
+                    "No misleading analysis available."
+                );
 
 
             // =============================================
@@ -289,17 +454,19 @@ document.addEventListener("DOMContentLoaded", function () {
                 headlineAnalysis.sensationalism ||
                 {};
 
-            const sensationalismStatus = formatLabel(
-                sensationalism.status ||
-                sensationalism.label ||
-                "Not analyzed"
-            );
+            const sensationalismStatus =
+                formatLabel(
+                    sensationalism.status ||
+                    sensationalism.label ||
+                    "Not analyzed"
+                );
 
-            const sensationalismReason = cleanText(
-                sensationalism.reason ||
-                sensationalism.explanation ||
-                "No sensationalism analysis available."
-            );
+            const sensationalismReason =
+                cleanText(
+                    sensationalism.reason ||
+                    sensationalism.explanation ||
+                    "No sensationalism analysis available."
+                );
 
 
             // =================================================
@@ -308,11 +475,18 @@ document.addEventListener("DOMContentLoaded", function () {
 
             let scoreSection = "";
 
-
             if (score !== null) {
 
-                scoreSection = `
+                const safeScore =
+                    Math.max(
+                        0,
+                        Math.min(
+                            100,
+                            score
+                        )
+                    );
 
+                scoreSection = `
                     <div class="score-card">
 
                         <div class="score-label">
@@ -320,7 +494,7 @@ document.addEventListener("DOMContentLoaded", function () {
                         </div>
 
                         <div class="score-number">
-                            ${score}
+                            ${escapeHtml(score)}
                             <span>/ 100</span>
                         </div>
 
@@ -328,22 +502,17 @@ document.addEventListener("DOMContentLoaded", function () {
 
                             <div
                                 class="score-fill fill-good"
-                                style="width: ${Math.max(
-                                    0,
-                                    Math.min(100, score)
-                                )}%"
+                                style="width: ${safeScore}%"
                             ></div>
 
                         </div>
 
                     </div>
-
                 `;
 
             } else {
 
                 scoreSection = `
-
                     <div class="score-card verification-card">
 
                         <div class="score-label">
@@ -358,7 +527,6 @@ document.addEventListener("DOMContentLoaded", function () {
                         </div>
 
                     </div>
-
                 `;
             }
 
@@ -375,52 +543,262 @@ document.addEventListener("DOMContentLoaded", function () {
                 claimsHtml = claims.map(
                     function (claim, index) {
 
-                        const verificationStatus =
-                            claim.verification?.status ||
+
+                        // -------------------------------------
+                        // VERIFICATION OBJECT
+                        // -------------------------------------
+
+                        const verification =
+                            claim.verification ||
+                            {};
+
+
+                        // -------------------------------------
+                        // VERIFICATION STATUS
+                        // -------------------------------------
+
+                        const claimVerificationStatus =
+                            verification.status ||
                             claim.verification_result ||
                             "UNVERIFIED";
 
 
+                        // -------------------------------------
+                        // VERIFICATION REASON
+                        // -------------------------------------
+
+                        const verificationReason =
+                            verification.reason ||
+                            claim.verification_reason ||
+                            verification.explanation ||
+                            "No detailed explanation was provided for this claim.";
+
+
+                        // -------------------------------------
+                        // SUPPORTING SOURCES
+                        // -------------------------------------
+
+                        let supportingSources =
+                            verification.supporting_sources ||
+                            [];
+
+
+                        // -------------------------------------
+                        // FALLBACK SOURCES
+                        // -------------------------------------
+
+                        if (
+                            !Array.isArray(supportingSources) ||
+                            supportingSources.length === 0
+                        ) {
+
+                            if (
+                                Array.isArray(
+                                    claim.evidence_sources
+                                )
+                            ) {
+
+                                supportingSources =
+                                    claim.evidence_sources
+                                        .map(function (item) {
+
+                                            if (
+                                                typeof item === "string"
+                                            ) {
+                                                return item;
+                                            }
+
+                                            return item?.source || "";
+                                        })
+                                        .filter(function (item) {
+                                            return item.trim() !== "";
+                                        });
+                            }
+                        }
+
+
+                        // -------------------------------------
+                        // SUPPORTED DETAILS
+                        // -------------------------------------
+
+                        const supportedDetails =
+                            verification.supported_details ||
+                            [];
+
+
+                        // -------------------------------------
+                        // UNSUPPORTED DETAILS
+                        // -------------------------------------
+
+                        const unsupportedDetails =
+                            verification.unsupported_details ||
+                            [];
+
+
+                        // -------------------------------------
+                        // ENTITIES
+                        // -------------------------------------
+
                         const entities =
-                            Array.isArray(claim.entities)
+                            Array.isArray(
+                                claim.entities
+                            )
                                 ? claim.entities.join(", ")
                                 : claim.entities ||
                                   "None";
 
+
+                        // -------------------------------------
+                        // SOURCE ATTRIBUTION
+                        // -------------------------------------
 
                         const source =
                             claim.source_attribution ||
                             "No source attribution";
 
 
+                        // -------------------------------------
+                        // VERIFICATION REQUIRED
+                        // -------------------------------------
+
                         const verificationRequired =
                             claim.verification_required ??
                             true;
 
+
+                        // -------------------------------------
+                        // CLAIM TEXT
+                        // -------------------------------------
 
                         const claimText =
                             claim.claim ||
                             "No claim text available.";
 
 
+                        // -------------------------------------
+                        // CLAIM TYPE
+                        // -------------------------------------
+
                         const claimType =
                             claim.type ||
                             "Fact";
 
 
-                        return `
+                        // -------------------------------------
+                        // EVIDENCE COUNT
+                        // -------------------------------------
 
+                        const evidenceCount =
+                            claim.evidence_count ??
+                            0;
+
+
+                        // -------------------------------------
+                        // STATUS LABEL
+                        // -------------------------------------
+
+                        const statusLabel =
+                            formatLabel(
+                                claimVerificationStatus
+                            );
+
+
+                        // -------------------------------------
+                        // EXPLANATION TITLE
+                        // -------------------------------------
+
+                        let explanationTitle =
+                            "Why this result?";
+
+                        if (
+                            claimVerificationStatus ===
+                            "PARTIALLY_SUPPORTED"
+                        ) {
+                            explanationTitle =
+                                "Why is this claim only partially supported?";
+                        }
+
+                        else if (
+                            claimVerificationStatus ===
+                            "SUPPORTED"
+                        ) {
+                            explanationTitle =
+                                "Why is this claim supported?";
+                        }
+
+                        else if (
+                            claimVerificationStatus ===
+                            "UNSUPPORTED"
+                        ) {
+                            explanationTitle =
+                                "Why is this claim unsupported?";
+                        }
+
+                        else if (
+                            claimVerificationStatus ===
+                            "CONTRADICTED"
+                        ) {
+                            explanationTitle =
+                                "Why is this claim contradicted?";
+                        }
+
+                        else if (
+                            claimVerificationStatus ===
+                            "UNVERIFIED"
+                        ) {
+                            explanationTitle =
+                                "Why could this claim not be verified?";
+                        }
+
+
+                        // -------------------------------------
+                        // DETAIL LISTS
+                        // -------------------------------------
+
+                        const supportedDetailsHtml =
+                            formatDetailList(
+                                "Details supported by the evidence:",
+                                supportedDetails
+                            );
+
+
+                        const unsupportedDetailsHtml =
+                            formatDetailList(
+                                "Details not confirmed by the evidence:",
+                                unsupportedDetails
+                            );
+
+
+                        // -------------------------------------
+                        // SOURCES HTML
+                        // -------------------------------------
+
+                        const sourcesHtml =
+                            formatSources(
+                                supportingSources
+                            );
+
+
+                        // -------------------------------------
+                        // CLAIM CARD
+                        // -------------------------------------
+
+                        return `
                             <div class="claim-card">
 
                                 <div class="claim-number">
                                     Claim ${index + 1}
                                 </div>
 
+
                                 <p class="claim-text">
                                     ${escapeHtml(
-                                        cleanText(claimText)
+                                        cleanText(
+                                            claimText
+                                        )
                                     )}
                                 </p>
+
 
                                 <div class="claim-details">
 
@@ -428,35 +806,66 @@ document.addEventListener("DOMContentLoaded", function () {
                                         <strong>
                                             Type:
                                         </strong>
+
                                         ${escapeHtml(
-                                            formatLabel(claimType)
+                                            formatLabel(
+                                                claimType
+                                            )
                                         )}
                                     </span>
+
 
                                     <span>
                                         <strong>
                                             Entities:
                                         </strong>
+
                                         ${escapeHtml(
-                                            cleanText(entities)
+                                            cleanText(
+                                                entities
+                                            )
                                         )}
                                     </span>
+
 
                                     <span>
                                         <strong>
                                             Source:
                                         </strong>
+
                                         ${escapeHtml(
-                                            cleanText(source)
+                                            cleanText(
+                                                source
+                                            )
                                         )}
                                     </span>
+
 
                                     <span>
                                         <strong>
                                             Verification Required:
                                         </strong>
-                                        ${verificationRequired}
+
+                                        ${escapeHtml(
+                                            String(
+                                                verificationRequired
+                                            )
+                                        )}
                                     </span>
+
+
+                                    <span>
+                                        <strong>
+                                            External Evidence:
+                                        </strong>
+
+                                        ${escapeHtml(
+                                            String(
+                                                evidenceCount
+                                            )
+                                        )}
+                                    </span>
+
 
                                     <span>
                                         <strong>
@@ -464,19 +873,46 @@ document.addEventListener("DOMContentLoaded", function () {
                                         </strong>
 
                                         ${escapeHtml(
-                                            formatLabel(
-                                                verificationStatus
-                                            )
+                                            statusLabel
                                         )}
-
                                     </span>
 
                                 </div>
 
+
+                                <!-- CLAIM EXPLANATION -->
+
+                                <div class="claim-explanation">
+
+                                    <div class="claim-explanation-title">
+                                        ${escapeHtml(
+                                            explanationTitle
+                                        )}
+                                    </div>
+
+
+                                    <p>
+                                        ${escapeHtml(
+                                            cleanText(
+                                                verificationReason
+                                            )
+                                        )}
+                                    </p>
+
+
+                                    ${supportedDetailsHtml}
+
+                                    ${unsupportedDetailsHtml}
+
+                                </div>
+
+
+                                <!-- SUPPORTING SOURCES -->
+
+                                ${sourcesHtml}
+
                             </div>
-
                         `;
-
                     }
                 ).join("");
 
@@ -491,12 +927,22 @@ document.addEventListener("DOMContentLoaded", function () {
 
 
             // =================================================
+            // EXPLANATION
+            // =================================================
+
+            const explanation =
+                data.explanation ||
+                "No explanation available.";
+
+
+            // =================================================
             // DISPLAY EVERYTHING
             // =================================================
 
             resultDiv.innerHTML = `
 
                 <div class="audit-results">
+
 
                     <h2>
                         Audit Results
@@ -512,9 +958,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
                     <div class="result-card headline-analysis">
 
-                        <h3>
+                        <h2>
                             Headline Analysis
-                        </h3>
+                        </h2>
 
 
                         <!-- HEADLINE -->
@@ -527,7 +973,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
                             <p class="headline-value">
                                 ${escapeHtml(
-                                    cleanText(headline)
+                                    cleanText(
+                                        headline
+                                    )
                                 )}
                             </p>
 
@@ -629,14 +1077,12 @@ document.addEventListener("DOMContentLoaded", function () {
 
                     <div class="result-card">
 
-                        <h3>
+                        <h2>
                             Extracted Claims
-                        </h3>
+                        </h2>
 
                         <div class="claims">
-
                             ${claimsHtml}
-
                         </div>
 
                     </div>
@@ -646,18 +1092,15 @@ document.addEventListener("DOMContentLoaded", function () {
 
                     <div class="result-card">
 
-                        <h3>
+                        <h2>
                             Explanation
-                        </h3>
+                        </h2>
 
-                        <p>
-                            ${escapeHtml(
-                                cleanText(
-                                    data.explanation ||
-                                    "No explanation available."
-                                )
+                        <div class="explanation-content">
+                            ${formatExplanation(
+                                explanation
                             )}
-                        </p>
+                        </div>
 
                     </div>
 
@@ -665,7 +1108,6 @@ document.addEventListener("DOMContentLoaded", function () {
                 </div>
 
             `;
-
         }
 
 
@@ -683,11 +1125,12 @@ document.addEventListener("DOMContentLoaded", function () {
             resultDiv.innerHTML = `
                 <p>
                     Error:
-                    ${escapeHtml(error.message)}
+                    ${escapeHtml(
+                        error.message
+                    )}
                 </p>
             `;
         }
-
     }
 
 
@@ -714,9 +1157,7 @@ document.addEventListener("DOMContentLoaded", function () {
                 event.preventDefault();
 
                 runAudit();
-
             }
-
         }
     );
 

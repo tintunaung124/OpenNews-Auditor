@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+requests
+trafilatura
+beautifulsoup4
+python-dotenv
+groq
+pydantic
+google-genai
+huggingface-hub
