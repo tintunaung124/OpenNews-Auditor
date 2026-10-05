@@ -4,11 +4,6 @@ document.addEventListener("DOMContentLoaded", function () {
     const searchButton = document.getElementById("search-button");
     const resultDiv = document.getElementById("result");
 
-
-    // ====================================================
-    // CLEAN AI TEXT
-    // ====================================================
-
     function cleanText(value) {
         if (!value) {
             return "";
@@ -33,20 +28,12 @@ document.addEventListener("DOMContentLoaded", function () {
 
             .trim();
     }
-
-
-    // ====================================================
     // FORMAT STATUS LABEL
-    // ====================================================
 
     function formatLabel(value) {
-
         if (!value) {
-            return "Not analyzed";
-        }
-
+            return "Not analyzed";}
         let label = cleanText(value);
-
         label = label
             .replace(/[_-]+/g, " ")
             .toLowerCase()
@@ -56,14 +43,9 @@ document.addEventListener("DOMContentLoaded", function () {
 
         return label;
     }
-
-
-    // ====================================================
     // GET TRUST SCORE
-    // ====================================================
 
     function getTrustScore(data) {
-
         const possibleScore =
             data.llm_score ??
             data.trust_score ??
@@ -84,13 +66,9 @@ document.addEventListener("DOMContentLoaded", function () {
         return null;
     }
 
-
-    // ====================================================
     // ESCAPE HTML
-    // ====================================================
 
     function escapeHtml(value) {
-
         return String(value ?? "")
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
@@ -99,13 +77,9 @@ document.addEventListener("DOMContentLoaded", function () {
             .replace(/'/g, "&#039;");
     }
 
-
-    // ====================================================
     // FORMAT SOURCE LIST
-    // ====================================================
 
     function formatSources(supportingSources) {
-
         if (
             !Array.isArray(supportingSources) ||
             supportingSources.length === 0
@@ -163,10 +137,7 @@ document.addEventListener("DOMContentLoaded", function () {
         `;
     }
 
-
-    // ====================================================
     // FORMAT DETAIL LIST
-    // ====================================================
 
     function formatDetailList(title, details) {
 
@@ -210,9 +181,7 @@ document.addEventListener("DOMContentLoaded", function () {
     }
 
 
-    // ====================================================
     // FORMAT EXPLANATION
-    // ====================================================
 
     function formatExplanation(text) {
 
@@ -260,19 +229,11 @@ document.addEventListener("DOMContentLoaded", function () {
             .join("");
     }
 
-
-    // ====================================================
     // SEARCH / AUDIT FUNCTION
-    // ====================================================
-
     async function runAudit() {
 
         const urlInput = articleUrl.value.trim();
-
-
-        // =================================================
         // CHECK URL
-        // =================================================
 
         if (!urlInput) {
 
@@ -284,12 +245,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
             return;
         }
-
-
-        // =================================================
         // LOADING
-        // =================================================
-
         resultDiv.innerHTML = `
             <p>
                 Analyzing article...
@@ -298,11 +254,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
 
         try {
-
-            // =============================================
             // SEND URL TO BACKEND
-            // =============================================
-
             const response = await fetch(
                 "/audit",
                 {
@@ -317,24 +269,14 @@ document.addEventListener("DOMContentLoaded", function () {
                     })
                 }
             );
-
-
-            // =============================================
             // READ RESPONSE
-            // =============================================
-
             const data = await response.json();
 
             console.log(
                 "Backend response:",
                 data
             );
-
-
-            // =============================================
             // BACKEND ERROR
-            // =============================================
-
             if (
                 !response.ok ||
                 data.error
@@ -351,59 +293,30 @@ document.addEventListener("DOMContentLoaded", function () {
 
                 return;
             }
-
-
-            // =============================================
             // TRUST SCORE
-            // =============================================
-
             const score = getTrustScore(data);
-
-
-            // =============================================
             // VERIFICATION STATUS
-            // =============================================
-
             const verificationStatus =
                 data.verification_status ||
                 null;
-
-
-            // =============================================
             // CLAIMS
-            // =============================================
-
             const claims =
                 data.extracted_claims ||
                 data.claims ||
                 [];
-
-
-            // =============================================
             // HEADLINE ANALYSIS
-            // =============================================
-
             const headlineAnalysis =
                 data.headline_analysis ||
                 data.headlineAnalysis ||
                 {};
-
-
-            // =============================================
             // HEADLINE
-            // =============================================
-
             const headline =
                 headlineAnalysis.headline ||
                 data.headline ||
                 data.title ||
                 "No headline available.";
 
-
-            // =============================================
             // BIAS
-            // =============================================
-
             const bias =
                 headlineAnalysis.bias ||
                 {};
@@ -422,11 +335,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     "No bias analysis available."
                 );
 
-
-            // =============================================
             // MISLEADING
-            // =============================================
-
             const misleading =
                 headlineAnalysis.misleading ||
                 {};
@@ -445,11 +354,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     "No misleading analysis available."
                 );
 
-
-            // =============================================
             // SENSATIONALISM
-            // =============================================
-
             const sensationalism =
                 headlineAnalysis.sensationalism ||
                 {};
@@ -468,11 +373,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     "No sensationalism analysis available."
                 );
 
-
-            // =================================================
             // SCORE SECTION
-            // =================================================
-
             let scoreSection = "";
 
             if (score !== null) {
@@ -529,11 +430,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     </div>
                 `;
             }
-
-
-            // =================================================
             // CLAIMS
-            // =================================================
 
             let claimsHtml = "";
 
@@ -542,51 +439,29 @@ document.addEventListener("DOMContentLoaded", function () {
 
                 claimsHtml = claims.map(
                     function (claim, index) {
-
-
-                        // -------------------------------------
                         // VERIFICATION OBJECT
-                        // -------------------------------------
-
                         const verification =
                             claim.verification ||
                             {};
-
-
-                        // -------------------------------------
                         // VERIFICATION STATUS
-                        // -------------------------------------
-
                         const claimVerificationStatus =
                             verification.status ||
                             claim.verification_result ||
                             "UNVERIFIED";
 
-
-                        // -------------------------------------
                         // VERIFICATION REASON
-                        // -------------------------------------
-
                         const verificationReason =
                             verification.reason ||
                             claim.verification_reason ||
                             verification.explanation ||
                             "No detailed explanation was provided for this claim.";
 
-
-                        // -------------------------------------
                         // SUPPORTING SOURCES
-                        // -------------------------------------
-
                         let supportingSources =
                             verification.supporting_sources ||
                             [];
 
-
-                        // -------------------------------------
                         // FALLBACK SOURCES
-                        // -------------------------------------
-
                         if (
                             !Array.isArray(supportingSources) ||
                             supportingSources.length === 0
@@ -615,30 +490,16 @@ document.addEventListener("DOMContentLoaded", function () {
                                         });
                             }
                         }
-
-
-                        // -------------------------------------
                         // SUPPORTED DETAILS
-                        // -------------------------------------
-
                         const supportedDetails =
                             verification.supported_details ||
                             [];
-
-
-                        // -------------------------------------
                         // UNSUPPORTED DETAILS
-                        // -------------------------------------
-
                         const unsupportedDetails =
                             verification.unsupported_details ||
                             [];
 
-
-                        // -------------------------------------
                         // ENTITIES
-                        // -------------------------------------
-
                         const entities =
                             Array.isArray(
                                 claim.entities
@@ -647,66 +508,38 @@ document.addEventListener("DOMContentLoaded", function () {
                                 : claim.entities ||
                                   "None";
 
-
-                        // -------------------------------------
                         // SOURCE ATTRIBUTION
-                        // -------------------------------------
-
                         const source =
                             claim.source_attribution ||
                             "No source attribution";
 
-
-                        // -------------------------------------
                         // VERIFICATION REQUIRED
-                        // -------------------------------------
-
                         const verificationRequired =
                             claim.verification_required ??
                             true;
 
-
-                        // -------------------------------------
                         // CLAIM TEXT
-                        // -------------------------------------
-
                         const claimText =
                             claim.claim ||
                             "No claim text available.";
 
-
-                        // -------------------------------------
                         // CLAIM TYPE
-                        // -------------------------------------
-
                         const claimType =
                             claim.type ||
                             "Fact";
 
-
-                        // -------------------------------------
                         // EVIDENCE COUNT
-                        // -------------------------------------
-
                         const evidenceCount =
                             claim.evidence_count ??
                             0;
 
-
-                        // -------------------------------------
                         // STATUS LABEL
-                        // -------------------------------------
-
                         const statusLabel =
                             formatLabel(
                                 claimVerificationStatus
                             );
 
-
-                        // -------------------------------------
                         // EXPLANATION TITLE
-                        // -------------------------------------
-
                         let explanationTitle =
                             "Why this result?";
 
@@ -750,10 +583,7 @@ document.addEventListener("DOMContentLoaded", function () {
                                 "Why could this claim not be verified?";
                         }
 
-
-                        // -------------------------------------
                         // DETAIL LISTS
-                        // -------------------------------------
 
                         const supportedDetailsHtml =
                             formatDetailList(
@@ -768,21 +598,13 @@ document.addEventListener("DOMContentLoaded", function () {
                                 unsupportedDetails
                             );
 
-
-                        // -------------------------------------
                         // SOURCES HTML
-                        // -------------------------------------
-
                         const sourcesHtml =
                             formatSources(
                                 supportingSources
                             );
 
-
-                        // -------------------------------------
                         // CLAIM CARD
-                        // -------------------------------------
-
                         return `
                             <div class="claim-card">
 
@@ -924,11 +746,7 @@ document.addEventListener("DOMContentLoaded", function () {
                     </p>
                 `;
             }
-
-
-            // =================================================
             // EXPLANATION
-            // =================================================
 
             const explanation =
                 data.explanation ||
@@ -1110,11 +928,7 @@ document.addEventListener("DOMContentLoaded", function () {
             `;
         }
 
-
-        // =================================================
         // ERROR
-        // =================================================
-
         catch (error) {
 
             console.error(
@@ -1133,21 +947,13 @@ document.addEventListener("DOMContentLoaded", function () {
         }
     }
 
-
-    // ====================================================
     // SEARCH BUTTON
-    // ====================================================
-
     searchButton.addEventListener(
         "click",
         runAudit
     );
 
-
-    // ====================================================
     // ENTER KEY
-    // ====================================================
-
     articleUrl.addEventListener(
         "keydown",
         function (event) {
