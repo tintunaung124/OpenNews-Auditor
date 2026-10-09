@@ -162,7 +162,6 @@ def initialize_ai_clients() -> None:
 
 initialize_ai_clients()
 
-
 class ArticleRequest(BaseModel):
     url: str
 
@@ -171,12 +170,10 @@ def clean_json_markdown(text: str) -> str:
     """Remove Markdown code fences around JSON."""
     if not text:
         return ""
-
     text = text.strip()
     text = re.sub(r"^```json\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"^```\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-
     return text.strip()
 
 
