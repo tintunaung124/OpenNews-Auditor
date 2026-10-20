@@ -2,6 +2,9 @@ import json
 import logging
 import os
 import re
+import difflib
+import ipaddress
+import html
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -11,11 +14,12 @@ import trafilatura
 import uvicorn
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from groq import Groq
 from pydantic import BaseModel
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode, urljoin, unquote
 
 
 # Alternative AI providers
@@ -70,11 +74,15 @@ DEFAULT_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-DEFAULT_TIMEOUT = 15
-GOOGLE_NEWS_TIMEOUT = 15
-MAX_NEWS_RESULTS = 8
+DEFAULT_TIMEOUT = 7
+GOOGLE_NEWS_TIMEOUT = 6
+MAX_NEWS_RESULTS = 5  # keep each claim bounded and avoid long audit runs
+MAX_WEB_SEARCH_RESULTS = 3
 MAX_EVIDENCE_SOURCES = 5
 MINIMUM_EVIDENCE_COVERAGE = 0.50
+MINIMUM_EVIDENCE_TEXT_LENGTH = 400
+ORIGINAL_TITLE_DUPLICATE_THRESHOLD = 0.90
+ARTICLE_DUPLICATE_TEXT_OVERLAP = 0.45
 
 
 # Verification results used throughout the application.
@@ -153,10 +161,9 @@ def initialize_ai_clients() -> None:
             )
 
     if not any([groq_client, gemini_client, hf_client]):
-        raise ValueError(
-            "No AI provider is configured. "
-            "Add GROQ_API_KEY, GEMINI_API_KEY, or HF_TOKEN "
-            "to the .env file."
+        logging.warning(
+            "No AI provider is configured. Set GROQ_API_KEY, "
+            "GEMINI_API_KEY, or HF_TOKEN before running an audit."
         )
 
 
@@ -316,16 +323,45 @@ def ask_ai(
     )
 
 #download the webpage 
+def validate_public_http_url(url: str) -> str:
+    """Validate a user-supplied URL before requesting it."""
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Please enter a complete article URL beginning with http:// or https://.")
+    hostname = parsed.hostname.lower()
+    if hostname in {"localhost", "localhost.localdomain"} or hostname.endswith(".local"):
+        raise ValueError("Local or private network URLs cannot be audited.")
+    # Reject literal private/loopback/link-local IPs.
+    import ipaddress
+    try:
+        address = ipaddress.ip_address(hostname)
+        if not address.is_global:
+            raise ValueError("Local or private network URLs cannot be audited.")
+    except ValueError as error:
+        if str(error) == "Local or private network URLs cannot be audited.":
+            raise
+        # A non-IP hostname is expected; DNS resolution is left to requests.
+    return url.strip()
+
+
 def fetch_url(url: str) -> str:
+    url = validate_public_http_url(url)
     try:
         response = requests.get(
-            url,headers=DEFAULT_HEADERS,timeout=DEFAULT_TIMEOUT)
+            url,
+            headers=DEFAULT_HEADERS,
+            timeout=DEFAULT_TIMEOUT,
+            allow_redirects=True,
+        )
         response.raise_for_status()
+        final_url = validate_public_http_url(response.url)
+        # Do not return content from a redirect into a local/private URL.
+        if final_url != response.url:
+            raise ValueError("Redirect destination is not allowed.")
         return response.text
     except requests.RequestException as error:
-        raise RuntimeError(
-            f"Could not access article URL: {error}"
-        )
+        raise RuntimeError(f"Could not access article URL: {error}") from error
+
 
 # extracts the headline , do trafilatura first and if that fail use beautifulSoup
 def extract_headline(html: str) -> str:
@@ -383,9 +419,20 @@ def extract_article_text(html: str) -> str:
 def fetch_article(url: str) -> dict[str, str]:
     logging.info(f"Fetching article: {url}")
     html = fetch_url(url)
+    canonical_url = ""
+    canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
+    if canonical_tag and canonical_tag.get("href"):
+        candidate = urljoin(url, canonical_tag["href"].strip())
+        try:
+            canonical_url = validate_public_http_url(candidate)
+        except ValueError:
+            canonical_url = ""
     return {
-        "text": extract_article_text(html),"headline": extract_headline(html),
-        "url": url}
+        "text": extract_article_text(html),
+        "headline": extract_headline(html),
+        "url": url,
+        "canonical_url": canonical_url,
+    }
 
 def extract_claims( # uses AI to extract the main claims 
     article_text: str
@@ -459,273 +506,545 @@ ARTICLE:
 
 
 def generate_search_query(
-    claim: dict[str, Any]
+    claim: dict[str, Any],
+    original_url: str = "",
 ) -> str:
-    """Build a search query locally without another AI call."""
-    claim_text = claim.get("claim", "")
-
+    """Build a focused query from the claim, preferring named entities."""
+    claim_text = str(claim.get("claim", "")).strip()
     if not claim_text:
         return ""
 
-    query_parts = []
-
-    entities = claim.get("entities", [])
-
-    if isinstance(entities, list):
-        query_parts.extend(
-            entity.strip()
-            for entity in entities
-            if isinstance(entity, str)
-            and entity.strip()
-        )
-
     stop_words = {
-        "the", "a", "an", "is", "are", "was", "were",
-        "be", "been", "being", "has", "have", "had",
-        "that", "this", "these", "those", "and", "or",
-        "but", "of", "to", "in", "on", "for", "with",
-        "from", "by", "as", "after", "before", "during",
-        "into", "its", "their", "it", "they", "he",
-        "she", "who", "which", "according", "said"
+        "the", "a", "an", "is", "are", "was", "were", "be", "been",
+        "being", "has", "have", "had", "that", "this", "these", "those",
+        "and", "or", "but", "of", "to", "in", "on", "for", "with",
+        "from", "by", "as", "after", "before", "during", "into", "its",
+        "their", "it", "they", "he", "she", "who", "which", "according",
+        "said", "says", "reported", "reports", "claim", "claims", "claimed",
+        "announced", "stated", "reportedly", "allegedly", "would", "could",
+        "should", "will", "may", "might", "about", "over", "under", "more",
+        "than", "also", "not", "no", "new", "one", "two", "first", "last",
     }
 
-    words = claim_text.split()
+    parts: list[str] = []
+    entity_tokens: set[str] = set()
+    entities = claim.get("entities", [])
+    if isinstance(entities, list):
+        for entity in entities:
+            if not isinstance(entity, str):
+                continue
+            entity = re.sub(r"\s+", " ", entity).strip(" \t\r\n.,!?;:")
+            if entity and entity.casefold() not in {p.strip('"').casefold() for p in parts}:
+                # Quoting multi-word entities helps search engines preserve names.
+                parts.append(f'"{entity}"' if " " in entity else entity)
+                entity_tokens.update(
+                    token.casefold() for token in re.findall(r"[\w'-]+", entity)
+                )
 
-    for word in words:
-        cleaned = word.strip(
-            ".,!?;:()[]{}\\\"'“”‘’"
-        )
-
-        if not cleaned:
+    for word in re.findall(r"[\w'-]+", claim_text, flags=re.UNICODE):
+        cleaned = word.strip("-'_")
+        if len(cleaned) < 3 or cleaned.casefold() in stop_words:
             continue
-
-        if cleaned.lower() in stop_words:
+        if cleaned.casefold() in entity_tokens:
             continue
-
-        if len(cleaned) <= 2:
-            continue
-
-        if cleaned not in query_parts:
-            query_parts.append(cleaned)
-
-        if len(query_parts) >= 10:
+        if cleaned.casefold() not in {p.strip('"').casefold() for p in parts}:
+            parts.append(cleaned)
+        if len(parts) >= 8:
             break
 
-    return " ".join(query_parts[:10])
+    # Keep the query concise; overly long queries can suppress useful results.
+    query = " ".join(parts[:8])
+    original_host = (urlparse(original_url).hostname or "").lower()
+    if original_host.startswith("www."):
+        original_host = original_host[4:]
+    if original_host and "." in original_host and not original_host.endswith("google.com"):
+        query += f" -site:{original_host}"
+    return query.strip()
 
 
-def fetch_google_news(query: str) -> list[dict[str, Any]]:
-    """Search Google News RSS for external reports."""
-    google_news_url = (
-        "https://news.google.com/rss/search"
-    )
-
-    params = {
-        "q": query,
-        "hl": "en-US",
-        "gl": "US",
-        "ceid": "US:en"
-    }
-
+def _parse_rss_articles(response_content: bytes, provider: str) -> list[dict[str, Any]]:
+    """Parse a news RSS response into normalized candidate records."""
     try:
-        response = requests.get(
-            google_news_url,
-            params=params,
-            headers=DEFAULT_HEADERS,
-            timeout=GOOGLE_NEWS_TIMEOUT
-        )
-
-        response.raise_for_status()
-
-    except requests.RequestException as error:
-        logging.error(
-            f"Google News RSS request error: {error}"
-        )
+        soup = BeautifulSoup(response_content, "xml")
+    except Exception as error:
+        logging.warning("Could not parse %s RSS: %s", provider, error)
         return []
 
-    soup = BeautifulSoup(
-        response.content,
-        "xml"
-    )
-
-    results = []
-    seen_urls = set()
-
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
     for item in soup.find_all("item"):
         title_tag = item.find("title")
         link_tag = item.find("link")
-
         if not title_tag or not link_tag:
             continue
 
-        google_url = link_tag.get_text(strip=True)
-
-        if not google_url or google_url in seen_urls:
+        link = link_tag.get_text(strip=True)
+        title = title_tag.get_text(" ", strip=True)
+        if not link or not title or link in seen:
             continue
-
-        seen_urls.add(google_url)
+        seen.add(link)
 
         description_tag = item.find("description")
         source_tag = item.find("source")
         published_tag = item.find("pubDate")
-
         description = ""
-
         if description_tag:
             description = BeautifulSoup(
-                description_tag.get_text(),
-                "html.parser"
+                description_tag.get_text(), "html.parser"
             ).get_text(" ", strip=True)
 
-        source = (
-            source_tag.get_text(strip=True)
-            if source_tag
-            else ""
-        )
+        source = source_tag.get_text(strip=True) if source_tag else ""
+        source_url = source_tag.get("url", "") if source_tag else ""
+        published = published_tag.get_text(strip=True) if published_tag else ""
+        host = (urlparse(link).hostname or "").lower()
 
-        published = (
-            published_tag.get_text(strip=True)
-            if published_tag
-            else ""
-        )
-
-        results.append(
-            {
-                "title": title_tag.get_text(strip=True),
-                "description": description,
-                "url": google_url,
-                "google_url": google_url,
-                "source": source,
-                "published": published,
-                "is_google_news_link": True
-            }
-        )
-
+        results.append({
+            "title": title,
+            "description": description,
+            "url": link,
+            "google_url": link if provider == "Google News" else "",
+            # Do not label a search-engine wrapper as the publisher. The
+            # actual publisher is determined after the article URL is resolved.
+            "source": source if source and not _is_search_wrapper_host((urlparse(source_url).hostname or "")) and source.casefold() not in {"bing", "bing news", "google news"} else "",
+            "source_url": source_url,
+            "published": published,
+            "provider": provider,
+            "is_google_news_link": provider == "Google News",
+        })
         if len(results) >= MAX_NEWS_RESULTS:
             break
-
     return results
 
 
-def search_news(
-    claim: dict[str, Any]
-) -> list[dict[str, Any]]:
-    """Search external news reports for one claim."""
-    claim_text = claim.get("claim", "")
-
-    logging.info(
-        f"Checking claim: {claim_text}"
-    )
-
-    search_query = generate_search_query(claim)
-
-    logging.info(
-        f"Generated search query: {search_query}"
-    )
-
-    if not search_query:
+def fetch_google_news(query: str) -> list[dict[str, Any]]:
+    """Search Google News RSS for candidate external reports."""
+    endpoint = "https://news.google.com/rss/search"
+    params = {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+    try:
+        response = requests.get(
+            endpoint, params=params, headers=DEFAULT_HEADERS,
+            timeout=GOOGLE_NEWS_TIMEOUT,
+        )
+        response.raise_for_status()
+        return _parse_rss_articles(response.content, "Google News")
+    except requests.RequestException as error:
+        logging.warning("Google News RSS request failed: %s", error)
         return []
 
-    articles = fetch_google_news(search_query)
+
+def fetch_bing_news(query: str) -> list[dict[str, Any]]:
+    """Fallback news search; Bing RSS often supplies publisher URLs directly."""
+    endpoint = "https://www.bing.com/news/search"
+    params = {"q": query, "format": "rss", "setlang": "en-US", "cc": "US"}
+    try:
+        response = requests.get(
+            endpoint, params=params, headers=DEFAULT_HEADERS,
+            timeout=GOOGLE_NEWS_TIMEOUT,
+        )
+        response.raise_for_status()
+        return _parse_rss_articles(response.content, "Bing News")
+    except requests.RequestException as error:
+        logging.warning("Bing News RSS request failed: %s", error)
+        return []
+
+
+
+# Legacy Bing HTML and DuckDuckGo scraping helpers were removed.
+# Normal audits use the bounded Bing News / Google News RSS workflow only.
+
+def search_news(
+    claim: dict[str, Any],
+    original_url: str = "",
+) -> list[dict[str, Any]]:
+    """Use bounded RSS searches; avoid slow/block-prone HTML search scraping."""
+    claim_text = str(claim.get("claim", "")).strip()
+    logging.info("Checking claim: %s", claim_text)
+    query = generate_search_query(claim, original_url)
+    if not query:
+        return []
+
+    # Bing News RSS usually supplies direct publisher URLs. Google News RSS is
+    # retained as a backup, but opaque Google URLs are not repeatedly searched
+    # through other providers if they cannot be resolved.
+    bing_results = fetch_bing_news(query)
+    google_results = fetch_google_news(query)
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    # Prefer Bing's publisher URLs. Only add a small number of Google News
+    # wrappers, because some cannot be resolved by automated clients.
+    for article in bing_results:
+        key = normalize_url(str(article.get("url", "")))
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(article)
+        if len(merged) >= MAX_NEWS_RESULTS:
+            break
+    if len(merged) < 3:
+        for article in google_results:
+            key = normalize_url(str(article.get("url", "")))
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(article)
+            if len(merged) >= MAX_NEWS_RESULTS:
+                break
+
+    # Only retry once with a short, broad query when both RSS feeds are empty.
+    if not merged:
+        words = [w for w in re.findall(r"[\w'-]+", claim_text) if len(w) > 3]
+        broad_query = " ".join(words[:7])
+        if broad_query and broad_query.casefold() != query.casefold():
+            bing_results = fetch_bing_news(broad_query)
+            google_results = fetch_google_news(broad_query)
+            for article in (bing_results + google_results):
+                key = normalize_url(str(article.get("url", "")))
+                if key and key not in seen:
+                    seen.add(key)
+                    merged.append(article)
+                if len(merged) >= MAX_NEWS_RESULTS:
+                    break
 
     logging.info(
-        f"Articles collected: {len(articles)}"
+        "Bounded RSS search: Bing RSS=%s, Google RSS=%s, merged=%s; HTML search fallbacks disabled",
+        len(bing_results), len(google_results), len(merged),
+    )
+    return merged
+
+def _is_search_wrapper_host(host: str) -> bool:
+    host = (host or "").lower().split(":", 1)[0]
+    return (
+        host in {"google.com", "www.google.com", "news.google.com"}
+        or host.endswith(".google.com")
+        or host in {"bing.com", "www.bing.com", "duckduckgo.com", "www.duckduckgo.com"}
+        or host.endswith(".duckduckgo.com")
     )
 
-    return articles
+
+def _embedded_target_url(url: str) -> str | None:
+    """Extract a publisher URL from common search redirect query parameters."""
+    try:
+        parsed = urlparse(url)
+        query = parse_qs(parsed.query)
+        for key in ("url", "u", "target", "to", "r"):
+            for value in query.get(key, []):
+                candidate = unquote(value).strip()
+                if candidate.startswith(("http://", "https://")):
+                    host = (urlparse(candidate).hostname or "").lower()
+                    if host and not _is_search_wrapper_host(host):
+                        return candidate
+    except Exception:
+        return None
+    return None
 
 
-def build_google_news_evidence(
-    article: dict[str, Any]
-) -> dict[str, Any]:
-    """Convert Google News metadata into evidence."""
-    title = article.get("title", "")
-    source = article.get("source", "")
-    published = article.get("published", "")
-    description = article.get("description", "")
+def resolve_publisher_url(url: str, expected_title: str = "") -> str | None:
+    """Resolve search-provider wrappers to a publisher URL where possible."""
+    if not url:
+        return None
+    try:
+        url = validate_public_http_url(url)
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if not _is_search_wrapper_host(host):
+            return url
 
-    return {
-        "title": title,
-        "description": description,
-        "url": article.get("url", ""),
-        "source": source,
-        "published": published,
-        "text": (
-            f"Headline: {title}\n"
-            f"Publisher: {source}\n"
-            f"Published: {published}\n"
-            f"Description: {description}"
-        ),
-        "evidence_type": "Google News RSS metadata"
-    }
+        embedded = _embedded_target_url(url)
+        if embedded:
+            return validate_public_http_url(embedded)
+
+        response = requests.get(
+            url, headers=DEFAULT_HEADERS, timeout=4,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        final_url = response.url
+        final_host = (urlparse(final_url).hostname or "").lower()
+        if not _is_search_wrapper_host(final_host):
+            response.close()
+            return validate_public_http_url(final_url)
+
+        # Some Google News links render a wrapper page instead of redirecting.
+        page_html = response.text
+        page = BeautifulSoup(page_html, "html.parser")
+        response.close()
+        for selector, attribute in [
+            ('link[rel="canonical"]', "href"),
+            ('meta[property="og:url"]', "content"),
+            ('meta[name="citation_public_url"]', "content"),
+            ('meta[itemprop="url"]', "content"),
+            ('[data-n-au]', "data-n-au"),
+            ('[data-n-url]', "data-n-url"),
+        ]:
+            tag = page.select_one(selector)
+            candidate = tag.get(attribute, "").strip() if tag else ""
+            if candidate:
+                candidate = html.unescape(candidate).replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+                candidate = urljoin(final_url, candidate)
+                candidate_host = (urlparse(candidate).hostname or "").lower()
+                if candidate_host and not _is_search_wrapper_host(candidate_host):
+                    try:
+                        return validate_public_http_url(candidate)
+                    except ValueError:
+                        pass
+
+        # Google sometimes embeds the publisher URL in page data rather than an anchor.
+        decoded_html = html.unescape(page_html).replace("\\u003d", "=").replace("\\u0026", "&").replace("\\/", "/")
+        embedded_candidates = re.findall(r"(?i)(?:https?:)?//[^\s\"'<>\\]+", decoded_html)
+        title_words_for_match = {
+            word.casefold() for word in re.findall(r"[\w'-]+", expected_title) if len(word) > 3
+        }
+        for raw_candidate in embedded_candidates:
+            candidate = raw_candidate if raw_candidate.startswith("http") else "https:" + raw_candidate
+            candidate = candidate.rstrip(".,);]")
+            candidate_host = (urlparse(candidate).hostname or "").lower()
+            if not candidate_host or _is_search_wrapper_host(candidate_host):
+                continue
+            try:
+                candidate = validate_public_http_url(candidate)
+            except ValueError:
+                continue
+            # Prefer URLs that resemble the expected article title; otherwise continue
+            # to the anchor matching below rather than selecting an arbitrary external URL.
+            url_words = {word.casefold() for word in re.findall(r"[\w'-]+", urlparse(candidate).path) if len(word) > 3}
+            if title_words_for_match and len(title_words_for_match & url_words) / len(title_words_for_match) >= 0.25:
+                return candidate
+
+        # Last resort: prefer an external link whose visible text resembles the
+        # RSS headline; never blindly use the source homepage as article evidence.
+        title_words = {
+            word.casefold() for word in re.findall(r"[\w'-]+", expected_title)
+            if len(word) > 3
+        }
+        best_url = None
+        best_overlap = 0.0
+        for anchor in page.find_all("a", href=True):
+            candidate = urljoin(final_url, anchor["href"])
+            candidate_host = (urlparse(candidate).hostname or "").lower()
+            if not candidate_host or _is_search_wrapper_host(candidate_host):
+                continue
+            anchor_words = {
+                word.casefold() for word in re.findall(
+                    r"[\w'-]+", anchor.get_text(" ", strip=True)
+                ) if len(word) > 3
+            }
+            overlap = len(title_words & anchor_words) / max(1, len(title_words))
+            if overlap > best_overlap:
+                best_overlap, best_url = overlap, candidate
+        if best_url and best_overlap >= 0.5:
+            return validate_public_http_url(best_url)
+
+        logging.info("Could not resolve search-provider URL: %s", url)
+        return None
+    except (requests.RequestException, ValueError) as error:
+        logging.warning("Could not resolve publisher URL %s: %s", url, error)
+        return None
+
+
+def _normalized_text(text: str) -> str:
+    text = (text or "").casefold()
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _title_similarity(first: str, second: str) -> float:
+    a, b = _normalized_text(first), _normalized_text(second)
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _text_overlap(first: str, second: str, n: int = 5) -> float:
+    """Measure copied/syndicated text using word-shingle containment."""
+    a = _normalized_text(first).split()
+    b = _normalized_text(second).split()
+    if min(len(a), len(b)) < n:
+        return 0.0
+    shingles_a = {tuple(a[i:i+n]) for i in range(len(a) - n + 1)}
+    shingles_b = {tuple(b[i:i+n]) for i in range(len(b) - n + 1)}
+    denominator = max(1, min(len(shingles_a), len(shingles_b)))
+    return len(shingles_a & shingles_b) / denominator
+
+
+def _looks_like_same_article(
+    candidate: dict[str, Any],
+    original_article: dict[str, Any] | None = None,
+    accepted_articles: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Conservatively reject exact copies and obvious syndicated duplicates."""
+    comparisons: list[dict[str, Any]] = list(accepted_articles or [])
+    if original_article:
+        comparisons.append(original_article)
+    title = str(candidate.get("title", ""))
+    body = str(candidate.get("text", ""))
+    for previous in comparisons:
+        previous_title = str(previous.get("headline") or previous.get("title", ""))
+        previous_body = str(previous.get("text", ""))
+        title_ratio = _title_similarity(title, previous_title)
+        text_overlap = _text_overlap(body, previous_body)
+        if title_ratio >= ORIGINAL_TITLE_DUPLICATE_THRESHOLD:
+            logging.info("Skipping likely duplicate article by title: %s", title)
+            return True
+        if text_overlap >= ARTICLE_DUPLICATE_TEXT_OVERLAP:
+            logging.info("Skipping likely syndicated/copied article: %s", title)
+            return True
+    return False
 
 
 def build_article_evidence(
-    article: dict[str, Any]
+    article: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Download and extract evidence from a normal article."""
-    url = article.get("url", "")
+    """Download full publisher article text; RSS metadata alone is never evidence."""
+    submitted_url = str(article.get("url", "")).strip()
+    if not submitted_url:
+        return None
 
-    if not url:
+    publisher_url = resolve_publisher_url(
+        submitted_url, expected_title=str(article.get("title", ""))
+    )
+    if not publisher_url:
+        # Do not trigger multiple secondary search-engine requests for every
+        # failed Google News URL. This was the main source of 10-minute audits.
+        logging.info("Skipping unresolved search-provider URL without secondary scraping: %s", submitted_url)
         return None
 
     try:
         response = requests.get(
-            url,
-            headers=DEFAULT_HEADERS,
-            timeout=DEFAULT_TIMEOUT
+            publisher_url, headers=DEFAULT_HEADERS, timeout=DEFAULT_TIMEOUT,
+            allow_redirects=True,
         )
-
         response.raise_for_status()
-
-        text = trafilatura.extract(
-            response.text,
-            include_comments=False,
-            include_tables=False,
-            include_links=False,
-            favor_precision=True
-        )
-
-        if not text:
+        final_url = validate_public_http_url(response.url)
+        final_host = (urlparse(final_url).hostname or "").lower()
+        if _is_search_wrapper_host(final_host):
+            response.close()
             return None
 
+        html = response.text
+        response.close()
+        text = trafilatura.extract(
+            html, include_comments=False, include_tables=False,
+            include_links=False, favor_precision=True,
+        ) or ""
+        # Try the existing HTML fallback when Trafilatura cannot extract enough.
+        if len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
+            fallback = fallback_extract_text(html)
+            if len(fallback.strip()) > len(text.strip()):
+                text = fallback
+        if not text or len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
+            logging.info("Skipping result with insufficient article text: %s", final_url)
+            return None
+
+        metadata = trafilatura.extract_metadata(html)
+        title = (getattr(metadata, "title", None) if metadata else None) or article.get("title", "")
+        rss_title = str(article.get("title", "") or "").strip()
+        # Search results can occasionally point to a similarly named but unrelated page.
+        if rss_title and title and _title_similarity(rss_title, str(title)) < 0.22:
+            logging.info("Skipping title-mismatched search result: %s", final_url)
+            return None
+        canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
+        canonical_url = ""
+        if canonical_tag and canonical_tag.get("href"):
+            candidate = urljoin(final_url, canonical_tag["href"].strip())
+            candidate_host = (urlparse(candidate).hostname or "").lower()
+            if candidate_host and not _is_search_wrapper_host(candidate_host):
+                try:
+                    canonical_url = validate_public_http_url(candidate)
+                except ValueError:
+                    canonical_url = ""
+
+        evidence_url = canonical_url or final_url
+
+        # Use the publisher's own metadata or the resolved article domain.
+        # Never expose Bing/Google News as the publisher just because the RSS
+        # search result was served through that provider.
+        metadata_site = str(getattr(metadata, "sitename", "") or "").strip() if metadata else ""
+        rss_source = str(article.get("source", "") or "").strip()
+        rss_source_host = (urlparse(rss_source).hostname or "").lower()
+        invalid_source_names = {"bing", "bing news", "google news", "www.bing.com", "bing.com", "news.google.com"}
+        if metadata_site and metadata_site.casefold() not in invalid_source_names:
+            source = metadata_site
+        elif rss_source and rss_source.casefold() not in invalid_source_names and not _is_search_wrapper_host(rss_source_host):
+            source = rss_source
+        else:
+            publisher_host = (urlparse(evidence_url).hostname or urlparse(final_url).hostname or "").lower()
+            if publisher_host.startswith("www."):
+                publisher_host = publisher_host[4:]
+            source = publisher_host or "External publisher"
+
         return {
-            "title": article.get("title", ""),
+            "title": str(title),
             "description": article.get("description", ""),
-            "url": url,
-            "source": article.get("source", ""),
+            "url": evidence_url,
+            "final_url": final_url,
+            "source": source,
             "published": article.get("published", ""),
             "text": text[:12000],
-            "evidence_type": "External article"
+            "evidence_type": "Full external article",
+            "provider": article.get("provider", ""),
         }
-
-    except requests.RequestException as error:
-        logging.warning(
-            f"Could not download evidence from {url}: {error}"
-        )
+    except (requests.RequestException, ValueError) as error:
+        logging.warning("Could not download evidence from %s: %s", publisher_url, error)
         return None
 
 
 def collect_evidence(
-    articles: list[dict[str, Any]]
+    articles: list[dict[str, Any]],
+    original_url: str,
+    original_article: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Collect usable evidence from search results."""
-    evidence = []
+    """Collect full-text evidence, excluding original and syndicated duplicates."""
+    evidence: list[dict[str, Any]] = []
+    original_normalized_urls = {normalize_url(original_url)}
+    if original_article:
+        for original_candidate in (
+            original_article.get("url", ""),
+            original_article.get("canonical_url", ""),
+        ):
+            normalized_candidate = normalize_url(str(original_candidate))
+            if normalized_candidate:
+                original_normalized_urls.add(normalized_candidate)
+    seen_urls: set[str] = set()
+    seen_domains: set[str] = set()
 
     for article in articles:
         if len(evidence) >= MAX_EVIDENCE_SOURCES:
             break
-
-        if article.get("is_google_news_link"):
-            evidence.append(
-                build_google_news_evidence(article)
-            )
+        raw_url = str(article.get("url", "")).strip()
+        if not raw_url:
+            continue
+        if normalize_url(raw_url) in original_normalized_urls:
+            logging.info("Skipping submitted article before downloading: %s", raw_url)
             continue
 
-        article_evidence = build_article_evidence(article)
+        item = build_article_evidence(article)
+        if not item:
+            continue
 
-        if article_evidence:
-            evidence.append(article_evidence)
+        resolved_url = item.get("url", "")
+        normalized_url = normalize_url(resolved_url)
+        final_normalized = normalize_url(item.get("final_url", ""))
+        if normalized_url in original_normalized_urls or final_normalized in original_normalized_urls:
+            logging.info("Skipping the submitted article after resolving redirects: %s", resolved_url)
+            continue
+        if not normalized_url or normalized_url in seen_urls or final_normalized in seen_urls:
+            continue
+
+        # Reject same article syndicated under a different publisher/domain.
+        if _looks_like_same_article(item, original_article, evidence):
+            continue
+
+        domain = (urlparse(resolved_url).hostname or "").lower()
+        if domain.startswith("www."):
+            domain = domain[4:]
+        if domain and domain in seen_domains:
+            continue
+
+        seen_urls.add(normalized_url)
+        if final_normalized:
+            seen_urls.add(final_normalized)
+        if domain:
+            seen_domains.add(domain)
+        evidence.append(item)
 
     return evidence
 
@@ -733,44 +1052,31 @@ def collect_evidence(
 def build_claim_evidence_text(
     claims: list[dict[str, Any]]
 ) -> str:
-    """Format all claims and evidence for the batch AI request."""
+    """Format only independently retrieved external article evidence."""
     sections = []
 
     for index, claim in enumerate(claims, start=1):
         evidence = claim.get("_evidence", [])
+        evidence_sections = []
 
-        evidence_sections = [
-            f"""
+        for evidence_index, item in enumerate(evidence, start=1):
+            evidence_sections.append(
+                f"""
 Evidence {evidence_index}
-
-Evidence type:
-{item.get('evidence_type', '')}
-
-Publisher:
-{item.get('source', '')}
-
-Title:
-{item.get('title', '')}
-
-Published:
-{item.get('published', '')}
-
-URL:
-{item.get('url', '')}
-
-Content:
-{item.get('text', '')[:1000]}
+Evidence type: {item.get('evidence_type', '')}
+Publisher: {item.get('source', '')}
+Title: {item.get('title', '')}
+Published: {item.get('published', '')}
+URL: {item.get('url', '')}
+Full article content:
+{item.get('text', '')[:2500]}
 """
-            for evidence_index, item in enumerate(
-                evidence,
-                start=1
             )
-        ]
 
         evidence_text = (
-            "\n".join(evidence_sections)
+            "\\n".join(evidence_sections)
             if evidence_sections
-            else "No usable external evidence was found."
+            else "No usable full-text external evidence was found."
         )
 
         sections.append(
@@ -778,28 +1084,18 @@ Content:
 ==================================================
 CLAIM {index}
 ==================================================
-
 Claim:
 {claim.get('claim', '')}
-
 Type:
 {claim.get('type', '')}
-
 Entities:
 {json.dumps(claim.get('entities', []))}
-
-Evidence from original article:
-{claim.get('evidence_in_article', '')}
-
-Source attribution:
-{claim.get('source_attribution', '')}
-
-External evidence:
+Independent external evidence:
 {evidence_text}
 """
         )
 
-    return "\n".join(sections)
+    return "\\n".join(sections)
 
 
 def build_verification_prompt(
@@ -839,35 +1135,37 @@ IMPORTANT RULES:
 
 6. Lack of evidence does NOT automatically mean false.
 
-7. A Google News RSS headline alone is weak evidence.
+7. A Google News or Bing RSS headline/snippet alone is NOT evidence; use only the retrieved full article text.
 
-8. Do not invent facts.
+8. Do not treat the submitted article, a copied/syndicated version of it, or repeated versions of the same report as independent corroboration.
 
-9. Do not assume multiple articles repeating the same statement
-   independently verify it.
+9. Do not invent facts.
 
-10. Compare exact details such as people, places, dates,
+10. Do not assume multiple articles repeating the same statement
+    independently verify it.
+
+11. Compare exact details such as people, places, dates,
     numbers, organizations, events, relationships, and actions.
 
-11. The reason MUST be specific to the individual claim.
+12. The reason MUST be specific to the individual claim.
 
-12. Do NOT use the same generic reason for multiple claims
+13. Do NOT use the same generic reason for multiple claims
     when the evidence differs.
 
-13. The reason should normally be 1-3 sentences.
+14. The reason should normally be 1-3 sentences.
 
-14. For PARTIALLY_SUPPORTED claims, explicitly identify both
+15. For PARTIALLY_SUPPORTED claims, explicitly identify both
     the supported portion and the missing or unconfirmed portion.
 
-15. For SUPPORTED claims, explain which evidence directly
+16. For SUPPORTED claims, explain which evidence directly
     confirms the important details.
 
-16. For UNSUPPORTED claims, explain why the provided evidence
+17. For UNSUPPORTED claims, explain why the provided evidence
     does not establish the claim.
 
-17. For CONTRADICTED claims, explain the specific conflict.
+18. For CONTRADICTED claims, explain the specific conflict.
 
-18. For UNVERIFIED claims, explain that the available evidence
+19. For UNVERIFIED claims, explain that the available evidence
     was insufficient and do not call the claim false.
 
 Return ONLY valid JSON.
@@ -899,168 +1197,151 @@ CLAIMS AND EVIDENCE:
 
 {claims_text}
 """
+def normalize_url(url: str) -> str:
+    """Normalize URLs for comparison while preserving meaningful query IDs."""
+    if not url:
+        return ""
+    parsed = urlparse(url.strip())
+    hostname = (parsed.hostname or "").lower()
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    port = parsed.port
+    netloc = hostname
+    if port and not ((parsed.scheme.lower() == "http" and port == 80) or (parsed.scheme.lower() == "https" and port == 443)):
+        netloc = f"{hostname}:{port}"
+
+    path = re.sub(r"/+", "/", parsed.path or "/").rstrip("/")
+    # Treat common AMP URL variants as the same publisher article.
+    path = re.sub(r"/(amp|amphtml)$", "", path, flags=re.IGNORECASE)
+    ignored_parameters = {
+        "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+        "utm_id", "utm_name", "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+        "ref", "ref_src", "ocid", "cmpid", "output", "amp",
+    }
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    filtered_query = {
+        key: values for key, values in query.items()
+        if key.lower() not in ignored_parameters
+    }
+    normalized_query = urlencode(sorted(filtered_query.items()), doseq=True)
+    return urlunparse((parsed.scheme.lower() or "https", netloc, path, "", normalized_query, ""))
 
 
 def verify_claims(
-    claims: list[dict[str, Any]]
+    claims: list[dict[str, Any]],
+    original_url: str,
+    original_article: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Search for evidence and verify claims in small AI batches."""
+    """Search for independent evidence and verify only claims with evidence."""
     if not claims:
         return []
 
-    prepared_claims = []
-
+    prepared_claims: list[dict[str, Any]] = []
     for index, claim in enumerate(claims, start=1):
-        logging.info(f"Searching evidence for claim {index}.")
-
-        articles = search_news(claim)
-        evidence = collect_evidence(articles)
-
+        logging.info("Searching external evidence for claim %s.", index)
+        articles = search_news(claim, original_url=original_url)
+        evidence = collect_evidence(articles, original_url, original_article)
         claim_copy = dict(claim)
         claim_copy["_evidence"] = evidence
         prepared_claims.append(claim_copy)
-
-    # Keep verification requests small enough for the AI provider limits.
-    batch_size = 3
-    all_verifications = {}
-
-    for batch_start in range(0, len(prepared_claims), batch_size):
-        batch = prepared_claims[
-            batch_start:batch_start + batch_size
-        ]
-
-        first_claim_number = batch_start + 1
-        last_claim_number = batch_start + len(batch)
-
         logging.info(
-            f"Verifying claims {first_claim_number}-{last_claim_number}."
+            "Usable independent full-text sources for claim %s: %s",
+            index, len(evidence),
         )
 
-        claims_text = build_claim_evidence_text(batch)
+    # Only claims with actual external article text are sent to the verifier.
+    # This prevents the model from generating verdicts from the claim alone.
+    evidence_claims = [
+        (index, claim) for index, claim in enumerate(prepared_claims, start=1)
+        if claim.get("_evidence")
+    ]
+    all_verifications: dict[int, dict[str, Any]] = {}
+    batch_size = 3
 
+    for batch_start in range(0, len(evidence_claims), batch_size):
+        indexed_batch = evidence_claims[batch_start:batch_start + batch_size]
+        batch_claims = [claim for _, claim in indexed_batch]
+        claims_text = build_claim_evidence_text(batch_claims)
         try:
             raw = ask_ai(
                 build_verification_prompt(claims_text),
                 purpose=(
-                    f"batch claim verification "
-                    f"({first_claim_number}-{last_claim_number})"
-                )
+                    f"batch claim verification ({indexed_batch[0][0]}-"
+                    f"{indexed_batch[-1][0]})"
+                ),
             )
-
             data = extract_json(raw)
-
             if isinstance(data, dict):
                 verifications = data.get("verifications", [])
             elif isinstance(data, list):
                 verifications = data
             else:
                 verifications = []
-
         except Exception as error:
             logging.error(
-                f"Batch verification error for claims "
-                f"{first_claim_number}-{last_claim_number}: {error}"
+                "Batch verification failed for claims %s-%s: %s",
+                indexed_batch[0][0], indexed_batch[-1][0], error,
             )
             verifications = []
 
-        # AI claim indexes are local to the current batch. Convert them
-        # back to the original claim indexes before combining the results.
         for item in verifications:
+            if not isinstance(item, dict):
+                continue
             try:
                 local_index = int(item.get("claim_index"))
-
-                if not 1 <= local_index <= len(batch):
-                    continue
-
-                global_index = batch_start + local_index
+            except (TypeError, ValueError):
+                continue
+            if 1 <= local_index <= len(indexed_batch):
+                global_index = indexed_batch[local_index - 1][0]
                 all_verifications[global_index] = item
 
-            except (TypeError, ValueError, AttributeError):
-                continue
-
-    verified_claims = []
-
-    for index, claim in enumerate(
-        prepared_claims,
-        start=1
-    ):
+    verified_claims: list[dict[str, Any]] = []
+    for index, claim in enumerate(prepared_claims, start=1):
         evidence = claim.pop("_evidence", [])
-
-        verification = all_verifications.get(
-            index,
-            {
-                "claim_index": index,
-                "status": "UNVERIFIED",
-                "reason": (
-                    "The AI verification service "
-                    "could not evaluate this claim."
-                ),
-                "supporting_sources": []
-            }
-        )
-
-        status = str(
-            verification.get(
-                "status",
-                "UNVERIFIED"
-            )
-        ).upper().strip()
-
+        verification = all_verifications.get(index, {})
+        status = str(verification.get("status", "UNVERIFIED")).upper().strip()
         if status not in ALLOWED_STATUSES:
             status = "UNVERIFIED"
 
-        reason = str(
-            verification.get(
-                "reason",
-                ""
-            )
-        ).strip()
-
-        if not reason:
+        if not evidence:
+            status = "UNVERIFIED"
             reason = (
-                "No detailed explanation was "
-                "provided for this verification result."
+                "No usable independent full-text external sources were found "
+                "for this claim. This does not mean the claim is false."
             )
+        else:
+            reason = str(verification.get("reason", "")).strip()
+            if not reason:
+                status = "UNVERIFIED"
+                reason = "The retrieved evidence was not sufficient to produce a reliable verdict."
 
-        supporting_sources = verification.get(
-            "supporting_sources",
-            []
-        )
-
-        if not isinstance(supporting_sources, list):
-            supporting_sources = []
-
-        verification.update(
-            {
-                "claim_index": index,
-                "status": status,
-                "reason": reason,
-                "supporting_sources": supporting_sources
-            }
-        )
-
-        claim.update(
-            {
-                "verification": verification,
-                "verification_result": status,
-                "verification_reason": reason,
-                "evidence_count": len(evidence),
-                "evidence_sources": [
-                    {
-                        "title": item.get("title", ""),
-                        "source": item.get("source", ""),
-                        "published": item.get("published", ""),
-                        "url": item.get("url", ""),
-                        "evidence_type": item.get(
-                            "evidence_type",
-                            ""
-                        )
-                    }
-                    for item in evidence
-                ]
-            }
-        )
-
+        # Always derive the source list from pages that were actually retrieved.
+        supporting_sources = [
+            item.get("source") or item.get("title") or "External publisher"
+            for item in evidence
+        ]
+        verification_result = {
+            "claim_index": index,
+            "status": status,
+            "reason": reason,
+            "supporting_sources": supporting_sources,
+        }
+        claim.update({
+            "verification": verification_result,
+            "verification_result": status,
+            "verification_reason": reason,
+            "evidence_count": len(evidence),
+            "evidence_sources": [
+                {
+                    "title": item.get("title", ""),
+                    "source": item.get("source", ""),
+                    "published": item.get("published", ""),
+                    "url": item.get("url", ""),
+                    "evidence_type": item.get("evidence_type", ""),
+                }
+                for item in evidence
+            ],
+        })
         verified_claims.append(claim)
 
     return verified_claims
@@ -1323,7 +1604,7 @@ def audit_article(
     url: str
 ) -> dict[str, Any]:
     """Run the complete article auditing pipeline."""
-    logging.info("Starting article audit.")
+    logging.info("Starting article audit using bounded RSS search (no DuckDuckGo/Bing HTML scraping).")
 
     article = fetch_article(url)
 
@@ -1345,7 +1626,11 @@ def audit_article(
             "No factual claims could be extracted from the article."
         )
 
-    verified_claims = verify_claims(claims)
+    verified_claims = verify_claims(
+        claims,
+        original_url=url,
+        original_article=article,
+    )
 
     score = calculate_score(
         verified_claims
@@ -1389,14 +1674,15 @@ def audit(
             request.url
         )
 
+    except ValueError as error:
+        logging.warning("Invalid audit request: %s", error)
+        raise HTTPException(status_code=400, detail=str(error))
     except Exception as error:
-        logging.error(
-            f"Audit endpoint error: {error}"
+        logging.exception("Audit endpoint error")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Article analysis failed: {error}",
         )
-
-        return {
-            "error": f"Article analysis failed: {error}"
-        }
 
 
 def main() -> None:
