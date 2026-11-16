@@ -5,8 +5,11 @@ import re
 import difflib
 import ipaddress
 import html
+from contextlib import contextmanager
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import requests
@@ -42,6 +45,24 @@ logging.basicConfig(
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+@contextmanager
+def timed_stage(stage: str, **fields: Any):
+    """Log elapsed time for one audit stage without changing its result."""
+    started = perf_counter()
+    try:
+        yield
+    finally:
+        details = " ".join(
+            f"{key}={value!r}" for key, value in fields.items() if value is not None
+        )
+        logging.info(
+            "TIMING stage=%s elapsed_seconds=%.3f%s",
+            stage,
+            perf_counter() - started,
+            f" {details}" if details else "",
+        )
 
 
 # Load environment variables.
@@ -134,7 +155,9 @@ def initialize_ai_clients() -> None:
 
     if GROQ_API_KEY:
         try:
-            groq_client = Groq(api_key=GROQ_API_KEY)
+            # Fall back to the next configured provider immediately when Groq
+            # is rate-limited instead of waiting through SDK retries.
+            groq_client = Groq(api_key=GROQ_API_KEY, max_retries=0)
             logging.info("Groq API enabled.")
         except Exception as error:
             logging.warning(f"Groq initialization failed: {error}")
@@ -298,11 +321,14 @@ def ask_ai(
             logging.info(
                 f"AI provider: {provider_name} for {purpose}"
             )
-
+            started = perf_counter()
             result = provider_function(prompt)
 
             logging.info(
-                f"{provider_name} succeeded."
+                "%s succeeded elapsed_seconds=%.3f retry_wait_seconds=0.000 purpose=%s",
+                provider_name,
+                perf_counter() - started,
+                purpose,
             )
 
             return result
@@ -418,21 +444,22 @@ def extract_article_text(html: str) -> str:
 # download and extract the article
 def fetch_article(url: str) -> dict[str, str]:
     logging.info(f"Fetching article: {url}")
-    html = fetch_url(url)
-    canonical_url = ""
-    canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
-    if canonical_tag and canonical_tag.get("href"):
-        candidate = urljoin(url, canonical_tag["href"].strip())
-        try:
-            canonical_url = validate_public_http_url(candidate)
-        except ValueError:
-            canonical_url = ""
-    return {
-        "text": extract_article_text(html),
-        "headline": extract_headline(html),
-        "url": url,
-        "canonical_url": canonical_url,
-    }
+    with timed_stage("article_fetch", url=url):
+        html = fetch_url(url)
+        canonical_url = ""
+        canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
+        if canonical_tag and canonical_tag.get("href"):
+            candidate = urljoin(url, canonical_tag["href"].strip())
+            try:
+                canonical_url = validate_public_http_url(candidate)
+            except ValueError:
+                canonical_url = ""
+        return {
+            "text": extract_article_text(html),
+            "headline": extract_headline(html),
+            "url": url,
+            "canonical_url": canonical_url,
+        }
 
 def extract_claims( # uses AI to extract the main claims 
     article_text: str
@@ -479,10 +506,11 @@ ARTICLE:
 """
 
     try:
-        raw = ask_ai(
-            prompt,
-            purpose="claim extraction"
-        )
+        with timed_stage("claim_extraction"):
+            raw = ask_ai(
+                prompt,
+                purpose="claim extraction"
+            )
 
         data = extract_json(raw)
 
@@ -666,8 +694,12 @@ def search_news(
     # Bing News RSS usually supplies direct publisher URLs. Google News RSS is
     # retained as a backup, but opaque Google URLs are not repeatedly searched
     # through other providers if they cannot be resolved.
-    bing_results = fetch_bing_news(query)
-    google_results = fetch_google_news(query)
+    with timed_stage("rss_search", query=query):
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            bing_future = executor.submit(fetch_bing_news, query)
+            google_future = executor.submit(fetch_google_news, query)
+            bing_results = bing_future.result()
+            google_results = google_future.result()
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()
     # Prefer Bing's publisher URLs. Only add a small number of Google News
@@ -693,8 +725,12 @@ def search_news(
         words = [w for w in re.findall(r"[\w'-]+", claim_text) if len(w) > 3]
         broad_query = " ".join(words[:7])
         if broad_query and broad_query.casefold() != query.casefold():
-            bing_results = fetch_bing_news(broad_query)
-            google_results = fetch_google_news(broad_query)
+            with timed_stage("rss_search_retry", query=broad_query):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    bing_future = executor.submit(fetch_bing_news, broad_query)
+                    google_future = executor.submit(fetch_google_news, broad_query)
+                    bing_results = bing_future.result()
+                    google_results = google_future.result()
             for article in (bing_results + google_results):
                 key = normalize_url(str(article.get("url", "")))
                 if key and key not in seen:
@@ -898,9 +934,10 @@ def build_article_evidence(
     if not submitted_url:
         return None
 
-    publisher_url = resolve_publisher_url(
-        submitted_url, expected_title=str(article.get("title", ""))
-    )
+    with timed_stage("url_resolution", url=submitted_url):
+        publisher_url = resolve_publisher_url(
+            submitted_url, expected_title=str(article.get("title", ""))
+        )
     if not publisher_url:
         # Do not trigger multiple secondary search-engine requests for every
         # failed Google News URL. This was the main source of 10-minute audits.
@@ -908,80 +945,81 @@ def build_article_evidence(
         return None
 
     try:
-        response = requests.get(
-            publisher_url, headers=DEFAULT_HEADERS, timeout=DEFAULT_TIMEOUT,
-            allow_redirects=True,
-        )
-        response.raise_for_status()
-        final_url = validate_public_http_url(response.url)
-        final_host = (urlparse(final_url).hostname or "").lower()
-        if _is_search_wrapper_host(final_host):
+        with timed_stage("evidence_download", url=publisher_url):
+            response = requests.get(
+                publisher_url, headers=DEFAULT_HEADERS, timeout=DEFAULT_TIMEOUT,
+                allow_redirects=True,
+            )
+            response.raise_for_status()
+            final_url = validate_public_http_url(response.url)
+            final_host = (urlparse(final_url).hostname or "").lower()
+            if _is_search_wrapper_host(final_host):
+                response.close()
+                return None
+
+            html = response.text
             response.close()
-            return None
+            text = trafilatura.extract(
+                html, include_comments=False, include_tables=False,
+                include_links=False, favor_precision=True,
+            ) or ""
+            # Try the existing HTML fallback when Trafilatura cannot extract enough.
+            if len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
+                fallback = fallback_extract_text(html)
+                if len(fallback.strip()) > len(text.strip()):
+                    text = fallback
+            if not text or len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
+                logging.info("Skipping result with insufficient article text: %s", final_url)
+                return None
 
-        html = response.text
-        response.close()
-        text = trafilatura.extract(
-            html, include_comments=False, include_tables=False,
-            include_links=False, favor_precision=True,
-        ) or ""
-        # Try the existing HTML fallback when Trafilatura cannot extract enough.
-        if len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
-            fallback = fallback_extract_text(html)
-            if len(fallback.strip()) > len(text.strip()):
-                text = fallback
-        if not text or len(text.strip()) < MINIMUM_EVIDENCE_TEXT_LENGTH:
-            logging.info("Skipping result with insufficient article text: %s", final_url)
-            return None
+            metadata = trafilatura.extract_metadata(html)
+            title = (getattr(metadata, "title", None) if metadata else None) or article.get("title", "")
+            rss_title = str(article.get("title", "") or "").strip()
+            # Search results can occasionally point to a similarly named but unrelated page.
+            if rss_title and title and _title_similarity(rss_title, str(title)) < 0.22:
+                logging.info("Skipping title-mismatched search result: %s", final_url)
+                return None
+            canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
+            canonical_url = ""
+            if canonical_tag and canonical_tag.get("href"):
+                candidate = urljoin(final_url, canonical_tag["href"].strip())
+                candidate_host = (urlparse(candidate).hostname or "").lower()
+                if candidate_host and not _is_search_wrapper_host(candidate_host):
+                    try:
+                        canonical_url = validate_public_http_url(candidate)
+                    except ValueError:
+                        canonical_url = ""
 
-        metadata = trafilatura.extract_metadata(html)
-        title = (getattr(metadata, "title", None) if metadata else None) or article.get("title", "")
-        rss_title = str(article.get("title", "") or "").strip()
-        # Search results can occasionally point to a similarly named but unrelated page.
-        if rss_title and title and _title_similarity(rss_title, str(title)) < 0.22:
-            logging.info("Skipping title-mismatched search result: %s", final_url)
-            return None
-        canonical_tag = BeautifulSoup(html, "html.parser").select_one('link[rel="canonical"]')
-        canonical_url = ""
-        if canonical_tag and canonical_tag.get("href"):
-            candidate = urljoin(final_url, canonical_tag["href"].strip())
-            candidate_host = (urlparse(candidate).hostname or "").lower()
-            if candidate_host and not _is_search_wrapper_host(candidate_host):
-                try:
-                    canonical_url = validate_public_http_url(candidate)
-                except ValueError:
-                    canonical_url = ""
+            evidence_url = canonical_url or final_url
 
-        evidence_url = canonical_url or final_url
+            # Use the publisher's own metadata or the resolved article domain.
+            # Never expose Bing/Google News as the publisher just because the RSS
+            # search result was served through that provider.
+            metadata_site = str(getattr(metadata, "sitename", "") or "").strip() if metadata else ""
+            rss_source = str(article.get("source", "") or "").strip()
+            rss_source_host = (urlparse(rss_source).hostname or "").lower()
+            invalid_source_names = {"bing", "bing news", "google news", "www.bing.com", "bing.com", "news.google.com"}
+            if metadata_site and metadata_site.casefold() not in invalid_source_names:
+                source = metadata_site
+            elif rss_source and rss_source.casefold() not in invalid_source_names and not _is_search_wrapper_host(rss_source_host):
+                source = rss_source
+            else:
+                publisher_host = (urlparse(evidence_url).hostname or urlparse(final_url).hostname or "").lower()
+                if publisher_host.startswith("www."):
+                    publisher_host = publisher_host[4:]
+                source = publisher_host or "External publisher"
 
-        # Use the publisher's own metadata or the resolved article domain.
-        # Never expose Bing/Google News as the publisher just because the RSS
-        # search result was served through that provider.
-        metadata_site = str(getattr(metadata, "sitename", "") or "").strip() if metadata else ""
-        rss_source = str(article.get("source", "") or "").strip()
-        rss_source_host = (urlparse(rss_source).hostname or "").lower()
-        invalid_source_names = {"bing", "bing news", "google news", "www.bing.com", "bing.com", "news.google.com"}
-        if metadata_site and metadata_site.casefold() not in invalid_source_names:
-            source = metadata_site
-        elif rss_source and rss_source.casefold() not in invalid_source_names and not _is_search_wrapper_host(rss_source_host):
-            source = rss_source
-        else:
-            publisher_host = (urlparse(evidence_url).hostname or urlparse(final_url).hostname or "").lower()
-            if publisher_host.startswith("www."):
-                publisher_host = publisher_host[4:]
-            source = publisher_host or "External publisher"
-
-        return {
-            "title": str(title),
-            "description": article.get("description", ""),
-            "url": evidence_url,
-            "final_url": final_url,
-            "source": source,
-            "published": article.get("published", ""),
-            "text": text[:12000],
-            "evidence_type": "Full external article",
-            "provider": article.get("provider", ""),
-        }
+            return {
+                "title": str(title),
+                "description": article.get("description", ""),
+                "url": evidence_url,
+                "final_url": final_url,
+                "source": source,
+                "published": article.get("published", ""),
+                "text": text[:12000],
+                "evidence_type": "Full external article",
+                "provider": article.get("provider", ""),
+            }
     except (requests.RequestException, ValueError) as error:
         logging.warning("Could not download evidence from %s: %s", publisher_url, error)
         return None
@@ -991,9 +1029,11 @@ def collect_evidence(
     articles: list[dict[str, Any]],
     original_url: str,
     original_article: dict[str, Any] | None = None,
+    evidence_cache: dict[str, dict[str, Any] | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Collect full-text evidence, excluding original and syndicated duplicates."""
     evidence: list[dict[str, Any]] = []
+    evidence_cache = evidence_cache if evidence_cache is not None else {}
     original_normalized_urls = {normalize_url(original_url)}
     if original_article:
         for original_candidate in (
@@ -1005,10 +1045,10 @@ def collect_evidence(
                 original_normalized_urls.add(normalized_candidate)
     seen_urls: set[str] = set()
     seen_domains: set[str] = set()
+    ordered_items: list[tuple[dict[str, Any], dict[str, Any] | None]] = []
+    pending: list[tuple[int, dict[str, Any], str]] = []
 
     for article in articles:
-        if len(evidence) >= MAX_EVIDENCE_SOURCES:
-            break
         raw_url = str(article.get("url", "")).strip()
         if not raw_url:
             continue
@@ -1016,7 +1056,26 @@ def collect_evidence(
             logging.info("Skipping submitted article before downloading: %s", raw_url)
             continue
 
-        item = build_article_evidence(article)
+        cache_key = normalize_url(raw_url)
+        item = evidence_cache.get(cache_key) if cache_key in evidence_cache else None
+        ordered_items.append((article, item))
+        if cache_key not in evidence_cache:
+            pending.append((len(ordered_items) - 1, article, cache_key))
+
+    # Resolve and download independent candidates concurrently, but keep the
+    # original RSS order when applying evidence and duplicate filters below.
+    if pending:
+        with ThreadPoolExecutor(max_workers=min(4, len(pending))) as executor:
+            futures = {
+                index: executor.submit(build_article_evidence, article)
+                for index, article, _ in pending
+            }
+            for index, _, cache_key in pending:
+                item = futures[index].result()
+                ordered_items[index] = (ordered_items[index][0], item)
+                evidence_cache[cache_key] = item
+
+    for article, item in ordered_items:
         if not item:
             continue
 
@@ -1237,10 +1296,16 @@ def verify_claims(
         return []
 
     prepared_claims: list[dict[str, Any]] = []
+    evidence_cache: dict[str, dict[str, Any] | None] = {}
     for index, claim in enumerate(claims, start=1):
         logging.info("Searching external evidence for claim %s.", index)
         articles = search_news(claim, original_url=original_url)
-        evidence = collect_evidence(articles, original_url, original_article)
+        evidence = collect_evidence(
+            articles,
+            original_url,
+            original_article,
+            evidence_cache=evidence_cache,
+        )
         claim_copy = dict(claim)
         claim_copy["_evidence"] = evidence
         prepared_claims.append(claim_copy)
@@ -1256,6 +1321,8 @@ def verify_claims(
         if claim.get("_evidence")
     ]
     all_verifications: dict[int, dict[str, Any]] = {}
+    # Keep evidence prompts below Groq's token-per-minute request limit so a
+    # large batch does not incur a slower provider fallback.
     batch_size = 3
 
     for batch_start in range(0, len(evidence_claims), batch_size):
@@ -1263,13 +1330,17 @@ def verify_claims(
         batch_claims = [claim for _, claim in indexed_batch]
         claims_text = build_claim_evidence_text(batch_claims)
         try:
-            raw = ask_ai(
-                build_verification_prompt(claims_text),
-                purpose=(
-                    f"batch claim verification ({indexed_batch[0][0]}-"
-                    f"{indexed_batch[-1][0]})"
-                ),
-            )
+            with timed_stage(
+                "ai_verification",
+                claims=f"{indexed_batch[0][0]}-{indexed_batch[-1][0]}",
+            ):
+                raw = ask_ai(
+                    build_verification_prompt(claims_text),
+                    purpose=(
+                        f"batch claim verification ({indexed_batch[0][0]}-"
+                        f"{indexed_batch[-1][0]})"
+                    ),
+                )
             data = extract_json(raw)
             if isinstance(data, dict):
                 verifications = data.get("verifications", [])
@@ -1483,10 +1554,11 @@ ARTICLE:
 """
 
     try:
-        raw = ask_ai(
-            prompt,
-            purpose="headline analysis"
-        )
+        with timed_stage("headline_analysis"):
+            raw = ask_ai(
+                prompt,
+                purpose="headline analysis"
+            )
 
         data = extract_json(raw)
 
@@ -1579,10 +1651,11 @@ Return only the explanation.
 """
 
     try:
-        return ask_ai(
-            prompt,
-            purpose="trust score explanation"
-        ).strip()
+        with timed_stage("score_explanation"):
+            return ask_ai(
+                prompt,
+                purpose="trust score explanation"
+            ).strip()
 
     except Exception as error:
         logging.error(
@@ -1604,6 +1677,7 @@ def audit_article(
     url: str
 ) -> dict[str, Any]:
     """Run the complete article auditing pipeline."""
+    audit_started = perf_counter()
     logging.info("Starting article audit using bounded RSS search (no DuckDuckGo/Bing HTML scraping).")
 
     article = fetch_article(url)
@@ -1632,8 +1706,11 @@ def audit_article(
         original_article=article,
     )
 
-    score = calculate_score(
-        verified_claims
+    score_started = perf_counter()
+    score = calculate_score(verified_claims)
+    logging.info(
+        "TIMING stage=score_calculation elapsed_seconds=%.3f",
+        perf_counter() - score_started,
     )
 
     verification_status = (
@@ -1652,7 +1729,7 @@ def audit_article(
         verified_claims
     )
 
-    return {
+    result = {
         "url": url,
         "headline": headline,
         "trust_score": score,
@@ -1662,6 +1739,14 @@ def audit_article(
         "extracted_claims": verified_claims,
         "claims": verified_claims
     }
+    logging.info(
+        "TIMING stage=audit_total elapsed_seconds=%.3f claims=%s evidence_claims=%s score=%s",
+        perf_counter() - audit_started,
+        len(verified_claims),
+        sum(1 for claim in verified_claims if claim.get("evidence_count", 0)),
+        score,
+    )
+    return result
 
 
 @app.post("/audit")
