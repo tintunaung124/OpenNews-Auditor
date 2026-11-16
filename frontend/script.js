@@ -947,11 +947,271 @@ document.addEventListener("DOMContentLoaded", function () {
         }
     }
 
+    function getClaimStatusV2(claim) {
+        return String(
+            claim?.verification?.status ||
+            claim?.verification_result ||
+            "UNVERIFIED"
+        ).toUpperCase();
+    }
+
+    function formatStatusLabelV2(status) {
+        return formatLabel(status || "NOT_ANALYZED");
+    }
+
+    function statusClassV2(status) {
+        return status.toLowerCase().replace(/_/g, "-");
+    }
+
+    function renderSourceDetailsV2(sources) {
+        if (!Array.isArray(sources) || sources.length === 0) {
+            return `<p class="source-empty">No sources returned</p>`;
+        }
+
+        return `
+            <div class="source-details">
+                ${sources.map(function (source) {
+                    if (typeof source === "string") {
+                        return `<div class="source-item"><strong>${escapeHtml(source)}</strong></div>`;
+                    }
+
+                    const title = source.title || "Untitled source";
+                    const publisher = source.source || "Publisher not provided";
+                    const published = source.published || "Date not provided";
+                    const evidenceType = source.evidence_type || "Evidence";
+                    const link = source.url || "";
+                    const linkHtml = link
+                        ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">Open source</a>`
+                        : "";
+
+                    return `
+                        <div class="source-item">
+                            <div class="source-item-heading">
+                                <strong>${escapeHtml(title)}</strong>
+                                ${linkHtml}
+                            </div>
+                            <div class="source-item-meta">
+                                <span>${escapeHtml(publisher)}</span>
+                                <span>${escapeHtml(published)}</span>
+                                <span>${escapeHtml(formatLabel(evidenceType))}</span>
+                            </div>
+                        </div>
+                    `;
+                }).join("")}
+            </div>
+        `;
+    }
+
+    function renderClaimV2(claim, index) {
+        const status = getClaimStatusV2(claim);
+        const verification = claim.verification || {};
+        const sources = Array.isArray(claim.evidence_sources)
+            ? claim.evidence_sources
+            : [];
+        const evidenceCount = sources.length;
+        const reason = cleanText(
+            verification.reason ||
+            claim.verification_reason ||
+            "No detailed explanation was provided for this claim."
+        );
+
+        return `
+            <article class="claim-card claim-${statusClassV2(status)}">
+                <div class="claim-header">
+                    <span class="claim-number">Claim ${index + 1}</span>
+                    <span class="verdict verdict-${statusClassV2(status)}">${escapeHtml(formatStatusLabelV2(status))}</span>
+                </div>
+                <p class="claim-text">${escapeHtml(cleanText(claim.claim || "No claim text available."))}</p>
+                <div class="claim-summary">
+                    <span>${escapeHtml(String(evidenceCount))} source${evidenceCount === 1 ? "" : "s"}</span>
+                    <span>${escapeHtml(formatLabel(claim.type || "Fact"))}</span>
+                </div>
+                <div class="claim-explanation">
+                    <h4>Why this result</h4>
+                    <p>${escapeHtml(reason)}</p>
+                    ${formatDetailList("Details supported by the evidence:", verification.supported_details || [])}
+                    ${formatDetailList("Details not confirmed by the evidence:", verification.unsupported_details || [])}
+                </div>
+                <div class="claim-sources">
+                    <h4>Evidence</h4>
+                    ${renderSourceDetailsV2(sources)}
+                </div>
+            </article>
+        `;
+    }
+
+    function renderHeadlineCheckV2(label, check) {
+        const status = check?.status || check?.label || "NOT_ANALYZED";
+        const reason = cleanText(
+            check?.reason ||
+            check?.explanation ||
+            "No analysis available."
+        );
+
+        return `
+            <div class="headline-check">
+                <div class="check-header">
+                    <strong>${escapeHtml(label)}</strong>
+                    <span class="headline-status">${escapeHtml(formatStatusLabelV2(status))}</span>
+                </div>
+                <p>${escapeHtml(reason)}</p>
+            </div>
+        `;
+    }
+
+    function renderSummaryV2(score, claims, verificationStatus, explanation) {
+        const counts = {
+            SUPPORTED: 0,
+            PARTIALLY_SUPPORTED: 0,
+            UNSUPPORTED: 0,
+            CONTRADICTED: 0,
+            UNVERIFIED: 0
+        };
+
+        claims.forEach(function (claim) {
+            const status = getClaimStatusV2(claim);
+            counts[status] = (counts[status] || 0) + 1;
+        });
+
+        const verifiedCount =
+            counts.SUPPORTED +
+            counts.PARTIALLY_SUPPORTED +
+            counts.UNSUPPORTED +
+            counts.CONTRADICTED;
+        const claimsWithSources = claims.filter(function (claim) {
+            return Array.isArray(claim.evidence_sources) && claim.evidence_sources.length > 0;
+        }).length;
+        const scoreHtml = score !== null
+            ? `<div class="summary-score-value">${escapeHtml(String(score))}<span>/100</span></div><p class="summary-score-label">Trust score</p>`
+            : `<p class="summary-status">Insufficient evidence for an overall trust score</p><p class="summary-score-label">${escapeHtml(verificationStatus || "Audit completed")}</p>`;
+        const sourceMetric = claimsWithSources > 0
+            ? `<div><strong>${claimsWithSources}</strong><span>claims with sources</span></div>`
+            : "";
+
+        return `
+            <section class="result-card summary-card" aria-labelledby="summary-title">
+                <div class="summary-main">
+                    <div>
+                        <span class="section-label">Overall assessment</span>
+                        <h2 id="summary-title">Audit results</h2>
+                        ${scoreHtml}
+                    </div>
+                    <p class="summary-explanation">${escapeHtml(cleanText(explanation || "No overall explanation available."))}</p>
+                </div>
+                <div class="summary-metrics" aria-label="Claim verdict counts">
+                    <div><strong>${counts.SUPPORTED}</strong><span>supported</span></div>
+                    <div><strong>${counts.PARTIALLY_SUPPORTED}</strong><span>partially supported</span></div>
+                    <div><strong>${counts.UNSUPPORTED}</strong><span>unsupported</span></div>
+                    <div><strong>${counts.UNVERIFIED}</strong><span>unverified</span></div>
+                    <div><strong>${verifiedCount}</strong><span>verified claims</span></div>
+                    ${sourceMetric}
+                </div>
+            </section>
+        `;
+    }
+
+    function renderErrorV2(message) {
+        resultDiv.innerHTML = `
+            <div class="state-card error-state" role="alert">
+                <span class="section-label">Audit error</span>
+                <h2>We could not complete the audit</h2>
+                <p>${escapeHtml(message)}</p>
+                <button type="button" class="retry-button" data-action="retry">Try again</button>
+            </div>
+        `;
+        articleUrl.focus();
+    }
+
+    async function runAuditV2() {
+        const urlInput = articleUrl.value.trim();
+
+        if (!urlInput) {
+            renderErrorV2("Enter a complete article URL, then try again.");
+            return;
+        }
+
+        resultDiv.innerHTML = `
+            <div class="state-card loading-state" role="status" aria-live="polite" aria-busy="true">
+                <span class="loading-mark" aria-hidden="true"></span>
+                <div>
+                    <h2>Analyzing article</h2>
+                    <p>Extracting claims and checking independent evidence. This may take a few minutes.</p>
+                </div>
+            </div>
+        `;
+
+        try {
+            const response = await fetch("/audit", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ url: urlInput })
+            });
+            const data = await response.json();
+
+            if (!response.ok || data.error || data.detail) {
+                renderErrorV2(
+                    data.error ||
+                    data.detail ||
+                    "The audit service returned an unexpected error. Check the URL and try again."
+                );
+                return;
+            }
+
+            const score = getTrustScore(data);
+            const claims = data.extracted_claims || data.claims || [];
+            const headlineAnalysis = data.headline_analysis || data.headlineAnalysis || {};
+            const headline = headlineAnalysis.headline || data.headline || data.title || "No headline available.";
+            const explanation = data.explanation || "No overall explanation available.";
+            const claimHtml = claims.length > 0
+                ? claims.map(renderClaimV2).join("")
+                : `<p class="empty-state">No factual claims were extracted.</p>`;
+
+            resultDiv.innerHTML = `
+                <div class="audit-results">
+                    ${renderSummaryV2(score, claims, data.verification_status, explanation)}
+                    <section class="result-card headline-analysis" aria-labelledby="headline-analysis-title">
+                        <span class="section-label">Headline review</span>
+                        <h2 id="headline-analysis-title">Headline analysis</h2>
+                        <p class="headline-value">${escapeHtml(cleanText(headline))}</p>
+                        <div class="headline-checks">
+                            ${renderHeadlineCheckV2("Bias", headlineAnalysis.bias)}
+                            ${renderHeadlineCheckV2("Misleading", headlineAnalysis.misleading)}
+                            ${renderHeadlineCheckV2("Sensationalism", headlineAnalysis.sensationalism)}
+                        </div>
+                    </section>
+                    <section class="result-card claims-section" aria-labelledby="claims-title">
+                        <div class="section-heading">
+                            <div>
+                                <span class="section-label">Claim review</span>
+                                <h2 id="claims-title">Extracted claims</h2>
+                            </div>
+                            <span class="section-count">${claims.length}</span>
+                        </div>
+                        <div class="claims">${claimHtml}</div>
+                    </section>
+                </div>
+            `;
+        } catch (error) {
+            console.error("Audit error:", error);
+            renderErrorV2(
+                error?.message
+                    ? `The audit request failed: ${error.message}`
+                    : "The audit service is unavailable. Check your connection and try again."
+            );
+        }
+    }
+
     // SEARCH BUTTON
     searchButton.addEventListener(
         "click",
-        runAudit
+        runAuditV2
     );
+
+    resultDiv.addEventListener("click", function (event) {
+        if (event.target.matches('[data-action="retry"]')) {
+            runAuditV2();
+        }
+    });
 
     // ENTER KEY
     articleUrl.addEventListener(
@@ -962,7 +1222,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
                 event.preventDefault();
 
-                runAudit();
+                runAuditV2();
             }
         }
     );

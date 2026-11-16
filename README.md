@@ -42,4 +42,4 @@ python -m uvicorn backend.main:app --reload --reload-dir backend
 ### 6. Open the Application
 
 Navigate to the following URL in your web browser:
-[http://127.0.0.1:8000](http://127.0.0.1:8000)
+[http://127.0.0.1:8001](http://127.0.0.1:8001)
