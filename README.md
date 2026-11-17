@@ -7,7 +7,7 @@ The system accepts an article URL, extracts the article content and headline, id
 The system then calculates an explainable Trust Score based on the verification results.
 
 ## Demo 
-[![Watch the demo](Thumbnail.png)](demo.mp4)
+![Demo](demo.gif)
 
 ## How to Install & Run Locally 
 
