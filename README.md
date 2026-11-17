@@ -11,10 +11,13 @@ The system then calculates an explainable Trust Score based on the verification 
 
 ## How to Install & Run Locally 
 
-### 1. Unzip the Project
+### 1. Clone the Repository
 
-1. Download the project ZIP file and extract it to a location on your computer.
-2. Open the extracted **OpenNews Auditor** folder in VS Code.
+Open your terminal and clone the project, then navigate into the project folder:
+
+```bash
+git clone https://github.com/tintunaung124/OpenNews-Auditor
+```
 
 ### 2. Create a Virtual Environment
 
